@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: maddpg-backend
+    runtime: python
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python backend_server.py --checkpoint-2obs checkpoints/maddpg_final-Ep17.pt --checkpoint-3obs checkpoints/maddpg_final-Ep17-o3-v2.pt --checkpoint-4obs checkpoints/maddpg_final-Ep17-o4-.pt
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
