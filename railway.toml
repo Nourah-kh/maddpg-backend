@@ -1,6 +1,6 @@
 [build]
-builder = "nixpacks"
 
-[build.aptPkgs]
-cmake = "*"
-build-essential = "*"
+[deploy]
+
+[deploy.variables]
+RAILPACK_BUILD_APT_PACKAGES = "cmake build-essential"
