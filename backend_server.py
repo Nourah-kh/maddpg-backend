@@ -18,7 +18,7 @@ import pybullet as p
 import pybullet_data
 
 from maddpg_networks import MADDPGAgent
-from custom_aviary_maddpg import CustomAviaryMADDPG
+from custom_aviary_standalone import CustomAviaryMADDPG
 
 
 # ══════════════════════════════════════════════════════════════
