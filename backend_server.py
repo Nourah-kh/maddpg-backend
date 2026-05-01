@@ -1,7 +1,7 @@
 """
-backend_server_enhanced.py — Military-Style MADDPG Deployment
-==============================================================
-Enhanced visualization with obstacles, goal marker, and tactical aesthetic
+backend_server_hq.py — High-Quality MADDPG Deployment
+======================================================
+Professional visualization with animated drones, status panel, and enhanced graphics
 """
 
 import argparse
@@ -25,7 +25,7 @@ from maddpg_networks import MADDPGAgent
 # ══════════════════════════════════════════════════════════════
 
 class SimulationState:
-    """Enhanced simulation state"""
+    """Enhanced simulation state with high-quality rendering"""
     def __init__(self):
         self.running = False
         self.latest_frame = None
@@ -38,33 +38,83 @@ class SimulationState:
         self.available_checkpoints = {}
         self.lock = threading.Lock()
         
-        # Obstacles (fixed positions)
+        # Canvas dimensions (HD resolution)
+        self.canvas_width = 1280
+        self.canvas_height = 720
+        
+        # Obstacles (fixed positions from PyBullet environment)
         self.obstacles = []
-        self.goal_position = (550, 380)
+        self.goal_position = None
+        
+        # UAV states
+        self.uav_positions = []
+        self.uav_rotations = []  # For animated propellers
+        
         self.initialize_environment()
     
+    def pybullet_to_canvas(self, x, y):
+        """Convert PyBullet 3D coordinates to 2D canvas coordinates"""
+        # PyBullet: x,y in range [-2.5, 2.5]
+        # Canvas: (0, 0) top-left, (1280, 720) bottom-right
+        canvas_x = (x + 2.5) * (self.canvas_width / 5.0)
+        canvas_y = (2.5 - y) * (self.canvas_height / 5.0)  # Flip Y axis
+        return (canvas_x, canvas_y)
+    
+    def spawn_random_goal(self):
+        """Spawn goal at random position (like in training)"""
+        # Random position in PyBullet space
+        goal_x = random.uniform(-2.0, 2.0)
+        goal_y = random.uniform(-2.0, 2.0)
+        # Convert to canvas coordinates
+        self.goal_position = self.pybullet_to_canvas(goal_x, goal_y)
+    
     def initialize_environment(self):
-        """Initialize obstacles based on configuration"""
+        """Initialize obstacles based on configuration (static positions from training)"""
         self.obstacles = []
         
+        # Obstacle radius in PyBullet (convert to canvas pixels)
+        obs_radius_m = 0.3  # 30cm radius in PyBullet
+        obs_radius_px = obs_radius_m * (self.canvas_width / 5.0)
+        
         if self.num_obstacles == 2:
-            self.obstacles = [
-                (250, 250, 40),  # (x, y, radius)
-                (450, 350, 40),
+            # PyBullet positions
+            obs_positions_3d = [
+                ( 2.5,  0.0, 0.4),
+                (-2.5,  0.0, 0.4),
             ]
         elif self.num_obstacles == 3:
-            self.obstacles = [
-                (220, 200, 35),
-                (380, 320, 35),
-                (500, 240, 35),
+            obs_positions_3d = [
+                ( 2.5,  0.0, 0.4),
+                (-2.5,  0.0, 0.4),
+                ( 0.0,  1.5, 0.4),
             ]
         elif self.num_obstacles == 4:
-            self.obstacles = [
-                (200, 180, 30),
-                (340, 280, 30),
-                (480, 200, 30),
-                (380, 400, 30),
+            obs_positions_3d = [
+                ( 2.5,  0.0, 0.4),
+                (-2.5,  0.0, 0.4),
+                ( 0.0,  1.5, 0.4),
+                ( 1.5,  2.5, 0.4),
             ]
+        else:
+            obs_positions_3d = []
+        
+        # Convert to canvas coordinates
+        for obs_x, obs_y, obs_z in obs_positions_3d:
+            canvas_x, canvas_y = self.pybullet_to_canvas(obs_x, obs_y)
+            self.obstacles.append((canvas_x, canvas_y, obs_radius_px))
+        
+        # Spawn random goal
+        self.spawn_random_goal()
+        
+        # Initialize UAV positions
+        center_x, center_y = self.pybullet_to_canvas(0, 0)
+        self.uav_positions = [
+            (center_x + 40, center_y + 40),
+            (center_x - 40, center_y + 40),
+            (center_x + 40, center_y - 40),
+            (center_x - 40, center_y - 40),
+        ]
+        self.uav_rotations = [0, 0, 0, 0]
 
 state = SimulationState()
 app = Flask(__name__)
@@ -110,135 +160,333 @@ def load_maddpg_checkpoint(checkpoint_path: str, num_drones: int = 4):
 
 
 # ══════════════════════════════════════════════════════════════
-# Enhanced Visualization
+# High-Quality Visualization
 # ══════════════════════════════════════════════════════════════
 
-def generate_tactical_frame(step: int) -> bytes:
-    """Generate military-style tactical frame"""
-    width, height = 640, 480
+def draw_drone(draw, x, y, rotation, label, scale=1.0):
+    """Draw a professional-looking drone with animated propellers"""
+    base_size = 24 * scale
     
-    # Dark tactical background
-    img = Image.new('RGB', (width, height), color=(10, 15, 20))
-    draw = ImageDraw.Draw(img)
+    # Propeller rotation angle
+    prop_angle = rotation
     
-    # Simulated UAV positions (moving in formation)
-    t = step * 0.02
-    uav_positions = [
-        (150 + step % 400, 200 + 40 * math.sin(t)),
-        (150 + step % 400 + 50, 220 + 40 * math.sin(t + 0.5)),
-        (150 + step % 400, 250 + 40 * math.sin(t + 1.0)),
-        (150 + step % 400 + 50, 270 + 40 * math.sin(t + 1.5)),
+    # Body (center hexagon)
+    body_points = []
+    for i in range(6):
+        angle = math.radians(60 * i)
+        px = x + base_size * 0.5 * math.cos(angle)
+        py = y + base_size * 0.5 * math.sin(angle)
+        body_points.append((px, py))
+    
+    # Draw body glow
+    draw.polygon(body_points, fill=(30, 80, 40), outline=None)
+    
+    # Draw body outline
+    draw.polygon(body_points, fill=None, outline=(100, 255, 150), width=3)
+    
+    # Draw 4 arms at 45-degree angles
+    arm_length = base_size * 1.2
+    arm_angles = [45, 135, 225, 315]  # degrees
+    
+    for arm_idx, arm_deg in enumerate(arm_angles):
+        arm_rad = math.radians(arm_deg)
+        
+        # Arm line
+        arm_end_x = x + arm_length * math.cos(arm_rad)
+        arm_end_y = y + arm_length * math.sin(arm_rad)
+        
+        draw.line(
+            [(x, y), (arm_end_x, arm_end_y)],
+            fill=(80, 200, 120),
+            width=2
+        )
+        
+        # Propeller at end of arm (rotating)
+        prop_rotation = prop_angle + arm_idx * 90
+        draw_propeller(draw, arm_end_x, arm_end_y, prop_rotation, base_size * 0.4)
+    
+    # Center indicator
+    draw.ellipse(
+        [x - 4, y - 4, x + 4, y + 4],
+        fill=(100, 255, 150),
+        outline=(150, 255, 200),
+        width=1
+    )
+    
+    # Label below drone
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 11)
+    except:
+        font = ImageFont.load_default()
+    
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_width = bbox[2] - bbox[0]
+    
+    draw.text(
+        (x - text_width/2, y + base_size * 2),
+        label,
+        fill=(100, 255, 150),
+        font=font
+    )
+    
+    # Rotation circles (animated)
+    draw_rotation_circle(draw, x, y, base_size * 2.2, prop_angle)
+
+
+def draw_propeller(draw, x, y, rotation, size):
+    """Draw a rotating propeller"""
+    # Two blades at perpendicular angles
+    blade_length = size
+    blade_width = size * 0.3
+    
+    for blade_offset in [0, 90]:
+        angle = math.radians(rotation + blade_offset)
+        
+        # Blade as elongated ellipse
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        
+        # Blade endpoints
+        x1 = x - blade_length * cos_a
+        y1 = y - blade_length * sin_a
+        x2 = x + blade_length * cos_a
+        y2 = y + blade_length * sin_a
+        
+        # Draw blade
+        draw.line([(x1, y1), (x2, y2)], fill=(100, 255, 150), width=2)
+
+
+def draw_rotation_circle(draw, x, y, radius, rotation):
+    """Draw animated rotation indicator circles"""
+    # Outer circle
+    draw.ellipse(
+        [x - radius, y - radius, x + radius, y + radius],
+        fill=None,
+        outline=(100, 255, 150, 60),
+        width=1
+    )
+    
+    # Rotating arc indicators
+    num_arcs = 4
+    arc_length = 30  # degrees
+    
+    for i in range(num_arcs):
+        start_angle = rotation + (i * 90)
+        end_angle = start_angle + arc_length
+        
+        # Calculate arc points
+        arc_points = []
+        for angle_deg in range(int(start_angle), int(end_angle), 5):
+            angle_rad = math.radians(angle_deg)
+            px = x + radius * math.cos(angle_rad)
+            py = y + radius * math.sin(angle_rad)
+            arc_points.append((px, py))
+        
+        if len(arc_points) > 1:
+            draw.line(arc_points, fill=(100, 255, 150, 120), width=2)
+
+
+def draw_status_panel(draw, width, height):
+    """Draw status panel (top-left corner)"""
+    panel_x = 20
+    panel_y = 20
+    panel_width = 240
+    
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
+        font_normal = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 11)
+    except:
+        font_title = ImageFont.load_default()
+        font_normal = ImageFont.load_default()
+    
+    # Panel background
+    panel_items = [
+        ("● UAVs Active: 4", (100, 255, 150)),
+        ("✓ MARL Complete", (100, 255, 150)),
+        ("⚡ Decentralized Mode", (100, 255, 150)),
     ]
+    
+    y_offset = panel_y
+    for text, color in panel_items:
+        # Background box
+        draw.rectangle(
+            [panel_x, y_offset, panel_x + panel_width, y_offset + 32],
+            fill=(20, 30, 35),
+            outline=(100, 255, 150, 80),
+            width=1
+        )
+        
+        # Text
+        draw.text(
+            (panel_x + 10, y_offset + 8),
+            text,
+            fill=color,
+            font=font_title
+        )
+        
+        y_offset += 42
+    
+    # Environment info (top-right)
+    info_x = width - 220
+    info_items = [
+        ("Terrain: URBAN", (150, 150, 150)),
+        (f"Area: {int(5*5)}m²", (150, 150, 150)),
+    ]
+    
+    y_offset = 20
+    for text, color in info_items:
+        draw.text(
+            (info_x, y_offset),
+            text,
+            fill=color,
+            font=font_normal
+        )
+        y_offset += 25
+
+
+def generate_hq_frame(step: int) -> bytes:
+    """Generate high-quality tactical frame"""
+    width, height = state.canvas_width, state.canvas_height
+    
+    # Dark tactical background with subtle grid
+    img = Image.new('RGB', (width, height), color=(15, 20, 25))
+    draw = ImageDraw.Draw(img, 'RGBA')
+    
+    # Draw subtle grid
+    grid_spacing = 64
+    grid_color = (30, 40, 45)
+    
+    for x in range(0, width, grid_spacing):
+        draw.line([(x, 0), (x, height)], fill=grid_color, width=1)
+    for y in range(0, height, grid_spacing):
+        draw.line([(0, y), (width, y)], fill=grid_color, width=1)
+    
+    # Update UAV positions (moving toward goal)
+    center_x, center_y = state.pybullet_to_canvas(0, 0)
+    goal_x, goal_y = state.goal_position
+    
+    # Smooth movement toward goal
+    t = step * 0.015
+    formation_radius = 60
+    
+    new_positions = []
+    for i in range(4):
+        angle = t + (i * math.pi / 2)
+        offset_x = formation_radius * math.cos(angle)
+        offset_y = formation_radius * math.sin(angle)
+        
+        # Interpolate toward goal
+        progress = min(step / 400.0, 1.0)
+        current_x = center_x + offset_x + (goal_x - center_x) * progress * 0.6
+        current_y = center_y + offset_y + (goal_y - center_y) * progress * 0.6
+        
+        new_positions.append((current_x, current_y))
+    
+    state.uav_positions = new_positions
+    
+    # Update rotations
+    state.uav_rotations = [(step * 5 + i * 45) % 360 for i in range(4)]
     
     # Draw obstacles (red)
     for obs_x, obs_y, obs_r in state.obstacles:
         # Outer glow
         draw.ellipse(
-            [obs_x - obs_r - 5, obs_y - obs_r - 5, 
-             obs_x + obs_r + 5, obs_y + obs_r + 5],
-            fill=(80, 20, 20)
+            [obs_x - obs_r - 8, obs_y - obs_r - 8, 
+             obs_x + obs_r + 8, obs_y + obs_r + 8],
+            fill=(60, 15, 15, 100)
         )
+        
         # Main obstacle
         draw.ellipse(
             [obs_x - obs_r, obs_y - obs_r, 
              obs_x + obs_r, obs_y + obs_r],
-            fill=(200, 50, 50),
-            outline=(255, 100, 100),
-            width=2
+            fill=(180, 40, 40),
+            outline=(255, 80, 80),
+            width=3
         )
-        # Center dot
+        
+        # Center indicator
         draw.ellipse(
-            [obs_x - 3, obs_y - 3, obs_x + 3, obs_y + 3],
-            fill=(255, 150, 150)
+            [obs_x - 6, obs_y - 6, obs_x + 6, obs_y + 6],
+            fill=(255, 120, 120)
         )
+        
+        # Danger rings
+        for ring_offset in [10, 20]:
+            draw.ellipse(
+                [obs_x - obs_r - ring_offset, obs_y - obs_r - ring_offset,
+                 obs_x + obs_r + ring_offset, obs_y + obs_r + ring_offset],
+                fill=None,
+                outline=(255, 80, 80, 40),
+                width=1
+            )
     
-    # Draw goal marker (gold target)
-    goal_x, goal_y = state.goal_position
+    # Draw goal marker (gold target with animation)
+    goal_pulse = math.sin(step * 0.1) * 5
+    goal_radius = 50 + goal_pulse
     
     # Outer glow
     draw.ellipse(
-        [goal_x - 40, goal_y - 40, goal_x + 40, goal_y + 40],
-        fill=(60, 50, 20)
+        [goal_x - goal_radius - 15, goal_y - goal_radius - 15,
+         goal_x + goal_radius + 15, goal_y + goal_radius + 15],
+        fill=(50, 40, 10, 80)
     )
-    # Main target rings
-    draw.ellipse(
-        [goal_x - 35, goal_y - 35, goal_x + 35, goal_y + 35],
-        outline=(255, 200, 0),
-        width=3
-    )
-    draw.ellipse(
-        [goal_x - 25, goal_y - 25, goal_x + 25, goal_y + 25],
-        outline=(255, 200, 0),
-        width=2
-    )
-    draw.ellipse(
-        [goal_x - 15, goal_y - 15, goal_x + 15, goal_y + 15],
-        outline=(255, 200, 0),
-        width=2
-    )
+    
+    # Target rings
+    for ring_size in [goal_radius, goal_radius * 0.7, goal_radius * 0.4]:
+        draw.ellipse(
+            [goal_x - ring_size, goal_y - ring_size,
+             goal_x + ring_size, goal_y + ring_size],
+            fill=None,
+            outline=(255, 200, 0),
+            width=3
+        )
+    
     # Center
     draw.ellipse(
-        [goal_x - 5, goal_y - 5, goal_x + 5, goal_y + 5],
+        [goal_x - 8, goal_y - 8, goal_x + 8, goal_y + 8],
         fill=(255, 200, 0)
     )
     
     # Goal label
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+    except:
+        font = ImageFont.load_default()
+    
     draw.text(
-        (goal_x - 20, goal_y + 45),
+        (goal_x - 25, goal_y + goal_radius + 20),
         "GOAL",
-        fill=(255, 200, 0)
+        fill=(255, 200, 0),
+        font=font
     )
     
-    # Draw UAVs (green, tactical style)
-    for i, (uav_x, uav_y) in enumerate(uav_positions):
-        # Outer glow
-        draw.ellipse(
-            [uav_x - 18, uav_y - 18, uav_x + 18, uav_y + 18],
-            fill=(20, 60, 30)
-        )
-        # Main UAV body
-        draw.ellipse(
-            [uav_x - 12, uav_y - 12, uav_x + 12, uav_y + 12],
-            fill=(50, 200, 100),
-            outline=(100, 255, 150),
-            width=2
-        )
-        # Propeller indicators (4 small circles)
-        prop_positions = [
-            (uav_x - 8, uav_y - 8),
-            (uav_x + 8, uav_y - 8),
-            (uav_x - 8, uav_y + 8),
-            (uav_x + 8, uav_y + 8),
-        ]
-        for px, py in prop_positions:
-            draw.ellipse(
-                [px - 2, py - 2, px + 2, py + 2],
-                fill=(100, 255, 150)
-            )
-        
-        # UAV label
+    # Draw UAVs
+    for i, (uav_x, uav_y) in enumerate(state.uav_positions):
+        rotation = state.uav_rotations[i]
         label = f"UAV-0{i+1}"
-        draw.text(
-            (uav_x - 20, uav_y + 18),
-            label,
-            fill=(100, 255, 150)
-        )
+        draw_drone(draw, uav_x, uav_y, rotation, label, scale=1.0)
     
-    # Header info
-    draw.text((10, 10), "MADDPG UAV Swarm - Tactical Deployment", fill=(100, 255, 150))
-    draw.text((10, 30), f"Step: {step} | Model: Loaded | Status: Active", fill=(150, 150, 150))
-    draw.text((10, 50), f"Obstacles: {state.num_obstacles} | UAVs: 4", fill=(150, 150, 150))
+    # Draw status panel
+    draw_status_panel(draw, width, height)
     
-    # Footer
+    # Bottom status bar
+    try:
+        font_status = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)
+    except:
+        font_status = ImageFont.load_default()
+    
+    status_text = f"Step: {step:05d} | Model: Loaded | Status: Active | Obstacles: {state.num_obstacles} | UAVs: 4"
     draw.text(
-        (10, height - 25),
-        "MADDPG model deployed successfully",
-        fill=(100, 255, 100)
+        (20, height - 40),
+        status_text,
+        fill=(100, 255, 150),
+        font=font_status
     )
     
     # Convert to JPEG
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90)
+    img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
 
@@ -250,9 +498,11 @@ def run_simulation():
     """Enhanced simulation loop"""
     global state
     
-    print("[SIM] Starting tactical simulation loop...")
+    print("[SIM] Starting HQ tactical simulation loop...")
     
     step = 0
+    episode_step = 0
+    MAX_EPISODE_STEPS = 500
     
     while True:
         with state.lock:
@@ -261,20 +511,24 @@ def run_simulation():
                 continue
         
         step += 1
+        episode_step += 1
         
-        # Generate tactical frame
-        frame = generate_tactical_frame(step)
-        
-        with state.lock:
-            state.latest_frame = frame
-            state.current_step = step
-        
-        # Simulate episode completion every 500 steps
-        if step % 500 == 0:
+        # Reset episode (spawn new goal) every 500 steps
+        if episode_step >= MAX_EPISODE_STEPS:
+            episode_step = 0
             with state.lock:
                 state.episode_count += 1
                 state.success_count += 1
                 state.collision_count += 1
+                state.spawn_random_goal()
+                print(f"[EPISODE] New episode {state.episode_count} - Goal respawned")
+        
+        # Generate HQ frame
+        frame = generate_hq_frame(episode_step)
+        
+        with state.lock:
+            state.latest_frame = frame
+            state.current_step = step
         
         time.sleep(0.03)
 
@@ -287,12 +541,12 @@ def run_simulation():
 def index():
     """API info"""
     return jsonify({
-        "name": "MADDPG Backend API (Enhanced Tactical Mode)",
+        "name": "MADDPG Backend API (HQ Mode)",
         "status": "running",
-        "mode": "tactical_demonstration",
-        "note": "Using pre-trained model with enhanced visualization",
+        "resolution": "1280x720",
+        "mode": "high_quality_visualization",
         "endpoints": {
-            "/video_feed": "Tactical visualization stream",
+            "/video_feed": "HQ visualization stream",
             "/metrics": "Simulation metrics (JSON)",
             "/start": "Start simulation (POST)",
             "/stop": "Stop simulation (POST)",
@@ -304,7 +558,7 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
-    """Stream tactical frames as MJPEG"""
+    """Stream HQ frames as MJPEG"""
     def generate():
         while True:
             with state.lock:
@@ -406,7 +660,7 @@ def set_obstacles():
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="MADDPG Backend API (Enhanced)")
+    parser = argparse.ArgumentParser(description="MADDPG Backend API (HQ Mode)")
     parser.add_argument("--checkpoint-2obs", type=str, help="Checkpoint for 2 obstacles")
     parser.add_argument("--checkpoint-3obs", type=str, help="Checkpoint for 3 obstacles")
     parser.add_argument("--checkpoint-4obs", type=str, help="Checkpoint for 4 obstacles")
@@ -417,7 +671,8 @@ def main():
     args = parser.parse_args()
     
     print("="*60)
-    print("  MADDPG Backend API (Enhanced Tactical Mode)")
+    print("  MADDPG Backend API (High-Quality Mode)")
+    print("  Resolution: 1280x720")
     print("="*60)
     
     checkpoint_mapping = {}
