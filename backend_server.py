@@ -189,7 +189,7 @@ def run_simulation():
             # Get actions from MADDPG agents
             actions = []
             for i, agent in enumerate(agents):
-                obs_tensor = torch.FloatTensor(obs[i]).unsqueeze(0)
+                obs_tensor = torch.FloatTensor(obs[f"drone_{i}"]).unsqueeze(0)
                 with torch.no_grad():
                     action = agent.actor(obs_tensor).cpu().numpy()[0]
                 actions.append(action)
@@ -215,7 +215,7 @@ def run_simulation():
             
             # Update
             obs = next_obs
-            episode_reward += sum(rewards)
+            episode_reward += sum(rewards.values())
             episode_step += 1
             
             # Check if done

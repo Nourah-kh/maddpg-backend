@@ -43,19 +43,23 @@ class CustomAviaryMADDPG:
         # State
         self.drone_ids = []
         self.obstacle_ids = []
+        self.goal_id = None  # Track goal body for cleanup
         self.goal_position = None
         self.step_count = 0
         
     def reset(self, seed=None):
         """Reset environment"""
-        # Remove old drones/obstacles
+        # Remove old drones/obstacles/goal
         for drone_id in self.drone_ids:
             p.removeBody(drone_id)
         for obs_id in self.obstacle_ids:
             p.removeBody(obs_id)
+        if self.goal_id is not None:
+            p.removeBody(self.goal_id)
         
         self.drone_ids = []
         self.obstacle_ids = []
+        self.goal_id = None
         self.step_count = 0
         
         # Spawn drones near origin
@@ -117,7 +121,7 @@ class CustomAviaryMADDPG:
         
         # Create goal marker
         goal_visual = p.createVisualShape(p.GEOM_SPHERE, radius=0.2, rgbaColor=[1, 0.8, 0, 1])
-        p.createMultiBody(
+        self.goal_id = p.createMultiBody(
             baseMass=0,
             baseVisualShapeIndex=goal_visual,
             basePosition=self.goal_position
@@ -141,8 +145,16 @@ class CustomAviaryMADDPG:
             obs[0:3] = pos  # position
             obs[3:6] = vel  # velocity
             obs[6:9] = p.getEulerFromQuaternion(orn)  # orientation
-            obs[9] = 0.0  # proximity (simplified)
-            obs[10:13] = self.goal_position - pos  # relative goal direction
+            
+            # Proximity: distance to nearest obstacle
+            min_dist = float('inf')
+            for obs_id in self.obstacle_ids:
+                obs_pos, _ = p.getBasePositionAndOrientation(obs_id)
+                d = np.linalg.norm(np.array(pos) - np.array(obs_pos))
+                min_dist = min(min_dist, d)
+            obs[9] = min_dist if min_dist < float('inf') else 0.0
+            
+            obs[10:13] = self.goal_position - np.array(pos)  # relative goal direction
             
             observations[f"drone_{i}"] = obs
         
