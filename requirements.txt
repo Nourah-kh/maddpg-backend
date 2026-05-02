@@ -4,6 +4,5 @@ pillow==9.5.0
 numpy==1.24.3
 pybullet==3.2.5
 gymnasium==0.29.1
-xvfbwrapper==0.2.9
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.1.0+cpu

@@ -17,13 +17,6 @@ import torch
 import pybullet as p
 import pybullet_data
 
-# Virtual display for headless mode
-try:
-    from xvfbwrapper import Xvfb
-    XVFB_AVAILABLE = True
-except ImportError:
-    XVFB_AVAILABLE = False
-
 from maddpg_networks import MADDPGAgent
 from custom_aviary_standalone import CustomAviaryMADDPG
 
@@ -189,7 +182,7 @@ def run_simulation():
             # Get actions from MADDPG agents
             actions = []
             for i, agent in enumerate(agents):
-                obs_tensor = torch.FloatTensor(obs[i]).unsqueeze(0)
+                obs_tensor = torch.FloatTensor(obs[f"drone_{i}"]).unsqueeze(0)
                 with torch.no_grad():
                     action = agent.actor(obs_tensor).cpu().numpy()[0]
                 actions.append(action)
@@ -215,7 +208,7 @@ def run_simulation():
             
             # Update
             obs = next_obs
-            episode_reward += sum(rewards)
+            episode_reward += sum(rewards.values())
             episode_step += 1
             
             # Check if done
@@ -372,14 +365,6 @@ def set_obstacles():
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    # Start virtual display for headless rendering
-    vdisplay = None
-    if XVFB_AVAILABLE and not os.environ.get('DISPLAY'):
-        print("[XVFB] Starting virtual display for headless mode...")
-        vdisplay = Xvfb(width=1280, height=720, colordepth=24)
-        vdisplay.start()
-        print("[XVFB] ✓ Virtual display started")
-    
     parser = argparse.ArgumentParser(description="MADDPG Backend API (Real PyBullet)")
     parser.add_argument("--checkpoint-2obs", type=str, help="Checkpoint for 2 obstacles")
     parser.add_argument("--checkpoint-3obs", type=str, help="Checkpoint for 3 obstacles")
