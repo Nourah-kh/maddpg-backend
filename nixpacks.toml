@@ -1,2 +1,0 @@
-[phases.setup]
-aptPkgs = ["xvfb", "xserver-xephyr", "x11-utils"]
