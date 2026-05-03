@@ -8,6 +8,7 @@ Standalone version for deployment that EXACTLY matches training environment:
   - resetBaseVelocity for actions (exact match)
   - ACTION_SMOOTHING=0.5 (exact match)
   - Real contact-point crash detection
+  - FLEXIBLE: dynamically adapt num_drones & num_obstacles per reset() call
 """
 
 import numpy as np
@@ -23,6 +24,7 @@ class CustomAviaryMADDPG:
     """MADDPG UAV environment - exact match to training environment"""
     
     def __init__(self, num_drones=4, num_obstacles=4, gui=False):
+        """Initialize environment with configurable drone/obstacle counts"""
         self.num_drones = num_drones
         self.num_obstacles = num_obstacles
         self.gui = gui
@@ -62,7 +64,7 @@ class CustomAviaryMADDPG:
         p.setGravity(0, 0, -self.GRAVITY)
         p.setPhysicsEngineParameter(fixedTimeStep=1.0/self.PYB_FREQ, numSubSteps=1)
         
-        # Load plane
+        # Load plane (once, never removed)
         self.plane_id = p.loadURDF("plane.urdf")
         
         # Observation and action spaces (per drone)
@@ -75,7 +77,7 @@ class CustomAviaryMADDPG:
             dtype=np.float32
         )
         
-        # State
+        # State (will be reinitialized in reset())
         self.drone_ids = []
         self.obstacle_ids = []
         self.goal_position = None
@@ -85,20 +87,45 @@ class CustomAviaryMADDPG:
         self.prev_cmd = np.zeros((num_drones, 4), dtype=np.float32)
         self._prev_dist = {f"drone_{i}": float("inf") for i in range(num_drones)}
         
-    def reset(self, seed=None):
-        """Reset environment"""
-        # Remove old drones/obstacles
-        for drone_id in self.drone_ids:
-            p.removeBody(drone_id)
-        for obs_id in self.obstacle_ids:
-            p.removeBody(obs_id)
+    def reset(self, seed=None, num_drones=None, num_obstacles=None):
+        """
+        Reset environment.
         
+        FLEXIBLE: Can change num_drones and num_obstacles per reset call!
+        Example:
+            env.reset(num_drones=2, num_obstacles=3)  # Changes config
+            env.reset(num_drones=4, num_obstacles=2)  # Different config next time
+        """
+        
+        # ═══ ALLOW DYNAMIC RECONFIGURATION ═══
+        if num_drones is not None:
+            self.num_drones = num_drones
+        if num_obstacles is not None:
+            self.num_obstacles = num_obstacles
+        
+        # ═══ COMPLETE CLEANUP OF OLD BODIES ═══
+        # Remove drones
+        for drone_id in self.drone_ids:
+            try:
+                p.removeBody(drone_id, physicsClientId=self.client)
+            except:
+                pass
+        
+        # Remove obstacles
+        for obs_id in self.obstacle_ids:
+            try:
+                p.removeBody(obs_id, physicsClientId=self.client)
+            except:
+                pass
+        
+        # ═══ REINITIALIZE STATE FOR NEW CONFIGURATION ═══
         self.drone_ids = []
         self.obstacle_ids = []
         self.step_count = 0
         self.crashed = np.zeros(self.num_drones, dtype=bool)
         self.crash_type = [None] * self.num_drones
         self.prev_cmd = np.zeros((self.num_drones, 4), dtype=np.float32)
+        self._prev_dist = {f"drone_{i}": float("inf") for i in range(self.num_drones)}
         
         # ══════════════════════════════════════════════════════════════
         # Load cf2x.urdf drones (EXACT MATCH to training)
@@ -117,16 +144,16 @@ class CustomAviaryMADDPG:
         # ══════════════════════════════════════════════════════════════
         # Spawn obstacles (EXACT MATCH to training positions)
         # ══════════════════════════════════════════════════════════════
-        obs_positions = [
+        all_obs_positions = [
             [2.5, 0., .4],
             [-2.5, 0., .4],
             [0., 1.5, .4],
+            [1.5, 2.5, .4],
         ]
-        if self.num_obstacles == 4:
-            obs_positions.append([1.5, 2.5, .4])
         
         assets = pybullet_data.getDataPath()
-        for pos in obs_positions[:self.num_obstacles]:
+        # Only spawn the number requested
+        for pos in all_obs_positions[:self.num_obstacles]:
             cube = p.loadURDF(
                 os.path.join(assets, "cube_no_rotation.urdf"),
                 pos,
@@ -145,9 +172,9 @@ class CustomAviaryMADDPG:
             np.random.uniform(*self.GOAL_Z_RANGE),
         ], dtype=np.float32)
         
-        # Initialize prev_dist
-        for i, drone_id in enumerate(self.drone_ids):
-            pos, _ = p.getBasePositionAndOrientation(drone_id, physicsClientId=self.client)
+        # Initialize prev_dist for current drone count
+        for i in range(self.num_drones):
+            pos, _ = p.getBasePositionAndOrientation(self.drone_ids[i], physicsClientId=self.client)
             self._prev_dist[f"drone_{i}"] = float(np.linalg.norm(np.array(pos) - self.goal_position))
         
         # Get initial observations
@@ -160,7 +187,8 @@ class CustomAviaryMADDPG:
         observations = {}
         PROX_RANGE = 5.0
         
-        for i, drone_id in enumerate(self.drone_ids):
+        for i in range(self.num_drones):  # ✅ Use self.num_drones, not len(self.drone_ids)
+            drone_id = self.drone_ids[i]
             pos, quat = p.getBasePositionAndOrientation(drone_id, physicsClientId=self.client)
             vel, ang_vel = p.getBaseVelocity(drone_id, physicsClientId=self.client)
             rpy = p.getEulerFromQuaternion(quat)
@@ -169,14 +197,15 @@ class CustomAviaryMADDPG:
             min_dist = float("inf")
             
             # Distance to obstacles
-            for obs_id in self.obstacle_ids:
+            for obs_id in self.obstacle_ids:  # ✅ Dynamically uses current obstacles
                 obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
                 d = np.linalg.norm(np.array(pos) - np.array(obs_pos))
                 min_dist = min(min_dist, d)
             
             # Distance to other drones
-            for j, other_drone_id in enumerate(self.drone_ids):
+            for j in range(self.num_drones):  # ✅ Use self.num_drones
                 if j != i:
+                    other_drone_id = self.drone_ids[j]
                     other_pos, _ = p.getBasePositionAndOrientation(other_drone_id, physicsClientId=self.client)
                     d = np.linalg.norm(np.array(pos) - np.array(other_pos))
                     min_dist = min(min_dist, d)
@@ -211,14 +240,21 @@ class CustomAviaryMADDPG:
         
         # ═══ CONVERT LIST → DICT IF NEEDED ═══
         if isinstance(actions, (list, tuple)):
+            # ✅ Validate action count matches drone count
+            if len(actions) != self.num_drones:
+                raise ValueError(
+                    f"Expected {self.num_drones} actions, got {len(actions)}"
+                )
             actions = {f"drone_{i}": np.array(actions[i]) for i in range(len(actions))}
         
         # ═══ APPLY ACTIONS WITH SMOOTHING ═══
-        for i, drone_id in enumerate(self.drone_ids):
+        for i in range(self.num_drones):  # ✅ Use self.num_drones
             if self.crashed[i]:
                 continue
             
+            drone_id = self.drone_ids[i]
             agent_key = f"drone_{i}"
+            
             if agent_key not in actions:
                 continue
             
@@ -262,7 +298,7 @@ class CustomAviaryMADDPG:
         
         # ═══ COMPUTE REWARDS ═══
         rewards = {}
-        for i in range(self.num_drones):
+        for i in range(self.num_drones):  # ✅ Use self.num_drones
             agent_key = f"drone_{i}"
             pos, _ = p.getBasePositionAndOrientation(self.drone_ids[i], physicsClientId=self.client)
             pos = np.array(pos)
@@ -289,7 +325,7 @@ class CustomAviaryMADDPG:
         truncated = {f"drone_{i}": self.step_count >= 300 for i in range(self.num_drones)}
         
         # Any crash terminates all
-        if any(self.crashed):
+        if any(self.crashed[:self.num_drones]):  # ✅ Check only active drones
             terminated = {f"drone_{i}": True for i in range(self.num_drones)}
         
         # Check if all reached goal
@@ -299,10 +335,10 @@ class CustomAviaryMADDPG:
                     self.drone_ids[i], physicsClientId=self.client
                 )[0]) - self.goal_position
             ) <= self.GOAL_RADIUS
-            for i in range(self.num_drones)
+            for i in range(self.num_drones)  # ✅ Check only active drones
         )
         
-        if all_at_goal and not any(self.crashed):
+        if all_at_goal and not any(self.crashed[:self.num_drones]):
             terminated = {f"drone_{i}": True for i in range(self.num_drones)}
         
         # RLlib compatibility
@@ -313,14 +349,16 @@ class CustomAviaryMADDPG:
     
     def _check_crashes(self):
         """Real contact-point crash detection (EXACT MATCH to training)"""
-        for i in range(self.num_drones):
+        for i in range(self.num_drones):  # ✅ Use self.num_drones
             if self.crashed[i]:
                 continue
+            
+            drone_id = self.drone_ids[i]
             
             # Drone-drone collisions
             for j in range(i + 1, self.num_drones):
                 if p.getContactPoints(
-                    self.drone_ids[i], self.drone_ids[j],
+                    drone_id, self.drone_ids[j],
                     physicsClientId=self.client,
                 ):
                     self.crashed[i] = self.crashed[j] = True
@@ -328,9 +366,9 @@ class CustomAviaryMADDPG:
                     self.crash_type[j] = "drone_collision"
             
             # Drone-obstacle collisions
-            for obs_id in self.obstacle_ids:
+            for obs_id in self.obstacle_ids:  # ✅ Dynamically uses current obstacles
                 if p.getContactPoints(
-                    self.drone_ids[i], obs_id,
+                    drone_id, obs_id,
                     physicsClientId=self.client,
                 ):
                     self.crashed[i] = True
