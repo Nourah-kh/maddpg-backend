@@ -13,7 +13,7 @@ Standalone version for deployment that EXACTLY matches training environment:
 
 import numpy as np
 from importlib.resources import files
-import gym_pybullet_drones
+
 import os
 
 
@@ -127,7 +127,7 @@ class CustomAviaryMADDPG:
         # ══════════════════════════════════════════════════════════════
         # Load cf2x.urdf drones (EXACT MATCH to training)
         # ══════════════════════════════════════════════════════════════
-        drone_path = str(files(gym_pybullet_drones) / "assets" / "cf2x.urdf")
+        drone_path = os.path.join(os.path.dirname(__file__), "cf2x.urdf")
         for i in range(self.num_drones):
             angle = 2 * np.pi * i / self.num_drones
             drone_id = p.loadURDF(
