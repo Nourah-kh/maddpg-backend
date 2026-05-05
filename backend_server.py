@@ -94,56 +94,105 @@ def create_environment(num_obstacles: int = 4):
     """Create PyBullet environment"""
     print(f"[ENV] Creating environment with {num_obstacles} obstacles")
     
-    # Create environment
     env = CustomAviaryMADDPG(
         num_drones=4,
-        obs_radius=0.3,
-        act_radius=0.3,
         num_obstacles=num_obstacles,
-        gui=False,  # Headless mode
-        record=False
+        gui=False,
     )
     
     print(f"[ENV] ✓ Environment created")
     return env
 
 
-def capture_frame_from_pybullet(env, width=1280, height=720):
-    """Capture frame from PyBullet simulation"""
-    
-    # Camera parameters
-    view_matrix = p.computeViewMatrixFromYawPitchRoll(
-        cameraTargetPosition=[0, 0, 0.5],
-        distance=5.0,
-        yaw=45,
-        pitch=-30,
-        roll=0,
-        upAxisIndex=2
-    )
-    
-    proj_matrix = p.computeProjectionMatrixFOV(
-        fov=60,
-        aspect=width / height,
-        nearVal=0.1,
-        farVal=100.0
-    )
-    
-    # Capture image
-    _, _, rgb, _, _ = p.getCameraImage(
-        width=width,
-        height=height,
-        viewMatrix=view_matrix,
-        projectionMatrix=proj_matrix,
-        renderer=p.ER_TINY_RENDERER
-    )
-    
-    # Convert to PIL Image
-    rgb_array = np.array(rgb, dtype=np.uint8)
-    rgb_array = np.reshape(rgb_array, (height, width, 4))[:, :, :3]
-    
-    img = Image.fromarray(rgb_array)
-    
-    return img
+def render_2d_topdown(env, width=1280, height=720):
+    """Render 2D top-down view of the environment using PIL"""
+    from PIL import ImageDraw, ImageFont
+
+    img = Image.new('RGB', (width, height), (15, 20, 25))
+    draw = ImageDraw.Draw(img, 'RGBA')
+
+    # Coordinate conversion: PyBullet [-5,5] -> canvas [0, width/height]
+    def world_to_canvas(x, y):
+        cx = (x + 5.0) * (width / 10.0)
+        cy = (5.0 - y) * (height / 10.0)
+        return cx, cy
+
+    # Subtle grid
+    for gx in range(0, width, 64):
+        draw.line([(gx, 0), (gx, height)], fill=(25, 35, 40), width=1)
+    for gy in range(0, height, 64):
+        draw.line([(0, gy), (width, gy)], fill=(25, 35, 40), width=1)
+
+    # Draw obstacles
+    for obs_id in env.obstacle_ids:
+        obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=env.CLIENT)
+        cx, cy = world_to_canvas(obs_pos[0], obs_pos[1])
+        r = 0.8 * (width / 10.0) / 2  # obstacle scale 0.8 -> radius in pixels
+
+        draw.ellipse([cx-r-6, cy-r-6, cx+r+6, cy+r+6], fill=(60, 15, 15, 100))
+        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(180, 40, 40), outline=(255, 80, 80), width=3)
+        draw.ellipse([cx-4, cy-4, cx+4, cy+4], fill=(255, 120, 120))
+
+    # Draw goal
+    gx, gy = world_to_canvas(env.goal_pos[0], env.goal_pos[1])
+    for ring in [40, 28, 16]:
+        draw.ellipse([gx-ring, gy-ring, gx+ring, gy+ring], outline=(255, 200, 0), width=3)
+    draw.ellipse([gx-6, gy-6, gx+6, gy+6], fill=(255, 200, 0))
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 12)
+    except Exception:
+        font = ImageFont.load_default()
+
+    draw.text((gx - 18, gy + 45), "GOAL", fill=(255, 200, 0), font=font)
+
+    # Draw drones
+    for i in range(env.NUM_DRONES):
+        pos, quat = p.getBasePositionAndOrientation(env.DRONE_IDS[i], physicsClientId=env.CLIENT)
+        cx, cy = world_to_canvas(pos[0], pos[1])
+
+        # Rotation circle
+        draw.ellipse([cx-28, cy-28, cx+28, cy+28], outline=(100, 255, 150, 60), width=1)
+
+        # Body
+        draw.ellipse([cx-14, cy-14, cx+14, cy+14], fill=(30, 80, 40), outline=(100, 255, 150), width=2)
+
+        # Propeller arms
+        import math
+        for angle_deg in [45, 135, 225, 315]:
+            rad = math.radians(angle_deg)
+            arm_x = cx + 20 * math.cos(rad)
+            arm_y = cy + 20 * math.sin(rad)
+            draw.line([(cx, cy), (arm_x, arm_y)], fill=(80, 200, 120), width=2)
+            draw.ellipse([arm_x-4, arm_y-4, arm_x+4, arm_y+4], fill=(100, 255, 150))
+
+        # Center dot
+        draw.ellipse([cx-4, cy-4, cx+4, cy+4], fill=(100, 255, 150))
+
+        # Label
+        label = f"UAV-0{i+1}"
+        draw.text((cx - 20, cy + 22), label, fill=(100, 255, 150), font=font)
+
+    # Status panel (top-left)
+    panel_items = [
+        f"UAVs Active: {env.NUM_DRONES}",
+        f"Obstacles: {env.NUM_OBSTACLES}",
+        f"Episode: {state.episode_count + 1}",
+        f"Step: {env.step_counter}/{env.MAX_STEPS}",
+    ]
+    y_off = 15
+    for text in panel_items:
+        draw.rectangle([15, y_off, 230, y_off + 28], fill=(20, 30, 35), outline=(100, 255, 150, 80), width=1)
+        draw.text((25, y_off + 6), text, fill=(100, 255, 150), font=font)
+        y_off += 36
+
+    # Termination info
+    if env.termination_reason:
+        draw.text((15, height - 30), f"Last: {env.termination_reason}", fill=(255, 200, 0), font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -151,7 +200,7 @@ def capture_frame_from_pybullet(env, width=1280, height=720):
 # ══════════════════════════════════════════════════════════════
 
 def run_simulation():
-    """Real simulation loop with MADDPG inference"""
+    """Real simulation loop with MADDPG inference - continuous episodes"""
     global state
     
     print("[SIM] Starting MADDPG simulation loop...")
@@ -165,64 +214,73 @@ def run_simulation():
             env = state.env
             agents = state.agents
         
-        # Reset environment
-        obs, _ = env.reset()
+        # Reset environment for new episode
+        try:
+            obs, info = env.reset()
+        except Exception as e:
+            print(f"[ERROR] Reset failed: {e}")
+            time.sleep(1)
+            continue
+        
         episode_reward = 0
         episode_step = 0
-        max_steps = 500
         done = False
         
         print(f"[EPISODE] Starting episode {state.episode_count + 1}")
         
-        while not done and episode_step < max_steps:
+        while not done:
             with state.lock:
                 if not state.running:
                     break
             
             # Get actions from MADDPG agents
-            actions = []
+            action_dict = {}
             for i, agent in enumerate(agents):
-                obs_tensor = torch.FloatTensor(obs[f"drone_{i}"]).unsqueeze(0)
+                aid = f"drone_{i}"
+                obs_tensor = torch.FloatTensor(obs[aid]).unsqueeze(0)
                 with torch.no_grad():
                     action = agent.actor(obs_tensor).cpu().numpy()[0]
-                actions.append(action)
+                action_dict[aid] = action
             
             # Step environment
-            next_obs, rewards, terminated, truncated, info = env.step(actions)
-            
-            # Capture frame from PyBullet
             try:
-                frame_img = capture_frame_from_pybullet(env, width=1280, height=720)
-                
-                # Convert to JPEG
-                buf = io.BytesIO()
-                frame_img.save(buf, format="JPEG", quality=90)
-                frame_bytes = buf.getvalue()
-                
+                next_obs, rewards, terminated, truncated, info = env.step(action_dict)
+            except Exception as e:
+                print(f"[ERROR] Step failed: {e}")
+                break
+            
+            # Render 2D top-down frame
+            try:
+                frame_bytes = render_2d_topdown(env, width=1280, height=720)
                 with state.lock:
                     state.latest_frame = frame_bytes
                     state.current_step += 1
-                
             except Exception as e:
-                print(f"[ERROR] Frame capture failed: {e}")
+                print(f"[ERROR] Render failed: {e}")
             
             # Update
             obs = next_obs
             episode_reward += sum(rewards.values())
             episode_step += 1
             
-            # Check if done
-            done = any(terminated.values()) or any(truncated.values())
+            # Check termination using __all__ key
+            done = terminated.get("__all__", False) or truncated.get("__all__", False)
             
-            time.sleep(0.03)  # ~30 FPS
+            time.sleep(0.03)
         
-        # Episode complete
+        # Episode complete - log and loop back to reset
         with state.lock:
             state.episode_count += 1
-            if episode_reward > 0:
+            if env.is_success:
                 state.success_count += 1
+            if env.is_collision:
+                state.collision_count += 1
         
-        print(f"[EPISODE] Complete - Reward: {episode_reward:.2f}, Steps: {episode_step}")
+        reason = env.termination_reason or "unknown"
+        print(f"[EPISODE] Complete - Reason: {reason}, Reward: {episode_reward:.2f}, Steps: {episode_step}")
+        
+        # Brief pause between episodes
+        time.sleep(0.5)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -273,16 +331,21 @@ def video_feed():
 def metrics():
     """Return current metrics as JSON"""
     with state.lock:
-        success_rate = (state.success_count / state.episode_count * 100) if state.episode_count > 0 else 0.0
+        episodes = state.episode_count
+        successes = state.success_count
+        collisions = state.collision_count
+        success_rate = (successes / episodes * 100) if episodes > 0 else 0.0
+        collision_rate = (collisions / episodes * 100) if episodes > 0 else 0.0
+        collision_avoidance = 100.0 - collision_rate
         
         return jsonify({
             "running": state.running,
-            "episodes": state.episode_count,
+            "episodes": episodes,
             "success_rate": success_rate,
             "current_step": state.current_step,
             "num_obstacles": state.num_obstacles,
-            "collision_avoidance": success_rate,
-            "swarm_coordination": 93.8,
+            "collision_avoidance": collision_avoidance,
+            "swarm_coordination": success_rate,
             "avg_response_time": 12.5,
         })
 
