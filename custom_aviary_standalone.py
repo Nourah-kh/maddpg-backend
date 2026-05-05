@@ -12,9 +12,6 @@ Standalone version for deployment that EXACTLY matches training environment:
 """
 
 import numpy as np
-import pybullet as p
-import pybullet_data
-from gymnasium import spaces
 from importlib.resources import files
 import gym_pybullet_drones
 import os
