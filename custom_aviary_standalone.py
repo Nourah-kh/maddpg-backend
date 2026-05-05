@@ -20,7 +20,7 @@ import os
 class CustomAviaryMADDPG:
     """MADDPG UAV environment - exact match to training environment"""
     
-    def __init__(self, num_drones=4, num_obstacles=4, gui=False):
+    def __init__(self, num_drones=4, num_obstacles=4, gui=False, **kwargs):
         """Initialize environment with configurable drone/obstacle counts"""
         self.num_drones = num_drones
         self.num_obstacles = num_obstacles
