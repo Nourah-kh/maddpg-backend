@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NASQ — UAV Swarm Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --g: #4ade80;
+            --g2: #22c55e;
+            --c: #00e5ff;
+            --bg: #05080f;
+            --bg2: #080d16;
+            --bg3: #0d1520;
+            --card: #0a1018;
+            --border: rgba(74,222,128,0.18);
+            --border-c: rgba(0,229,255,0.15);
+            --glow: rgba(74,222,128,0.12);
+            --glow-c: rgba(0,229,255,0.1);
+            --text-dim: #6b7a8d;
+        }
+
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: 'Rajdhani', sans-serif;
+            background: var(--bg);
+            color: #c8d8e8;
+            overflow-x: hidden;
+        }
+
+        /* ─── CANVAS BACKGROUND ─── */
+        #swarm-canvas {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            z-index: 0;
+            pointer-events: none;
+            opacity: 0.6;
+        }
+
+        /* ─── NOISE GRAIN OVERLAY ─── */
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+            pointer-events: none;
+            z-index: 1;
+            opacity: 0.4;
+        }
+
+        /* ─── NAV ─── */
+        .nav {
+            position: fixed; top: 0; left: 0; right: 0;
+            background: rgba(5,8,15,0.92);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border);
+            padding: 14px 48px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 100;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .logo img {
+            width: 52px;
+            height: 52px;
+            object-fit: contain;
+            /* removed mix-blend-mode: screen — it was hiding the logo on dark backgrounds */
+            filter: drop-shadow(0 0 10px rgba(74,222,128,0.5)) brightness(1.1);
+        }
+
+        .logo-text { display: flex; flex-direction: column; }
+
+        .logo-name {
+            font-family: 'Orbitron', monospace;
+            font-size: 20px;
+            font-weight: 800;
+            color: var(--g);
+            letter-spacing: 4px;
+            line-height: 1;
+            text-shadow: 0 0 20px rgba(74,222,128,0.5);
+        }
+
+        .logo-sub {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            color: var(--text-dim);
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            margin-top: 3px;
+        }
+
+        .nav-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 10px;
+            color: var(--text-dim);
+            letter-spacing: 2px;
+        }
+
+        .nav-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: var(--g);
+            box-shadow: 0 0 10px var(--g);
+            animation: pulse-dot 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%       { opacity: 0.4; transform: scale(0.7); }
+        }
+
+        /* ─── HERO ─── */
+        .hero {
+            position: relative;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+            padding: 120px 40px 80px;
+            z-index: 2;
+        }
+
+        .hero-eyebrow {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            letter-spacing: 5px;
+            color: var(--c);
+            text-transform: uppercase;
+            margin-bottom: 28px;
+            opacity: 0;
+            animation: fade-up 0.8s 0.2s forwards;
+        }
+
+        .hero-title {
+            font-family: 'Orbitron', monospace;
+            font-size: clamp(42px, 7vw, 90px);
+            font-weight: 900;
+            line-height: 0.95;
+            letter-spacing: -1px;
+            color: #fff;
+            margin-bottom: 12px;
+            opacity: 0;
+            animation: fade-up 0.8s 0.4s forwards;
+            text-shadow: 0 0 60px rgba(74,222,128,0.15);
+        }
+
+        .hero-title .accent {
+            background: linear-gradient(90deg, var(--g), var(--c));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            display: block;
+        }
+
+        .hero-desc {
+            max-width: 520px;
+            font-size: 16px;
+            font-weight: 400;
+            line-height: 1.7;
+            color: #7a8fa8;
+            margin: 28px auto 44px;
+            opacity: 0;
+            animation: fade-up 0.8s 0.8s forwards;
+            font-family: 'Rajdhani', sans-serif;
+        }
+
+        .hero-cta {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            padding: 16px 36px;
+            background: transparent;
+            border: 1px solid var(--g);
+            color: var(--g);
+            font-family: 'Orbitron', monospace;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+            opacity: 0;
+            animation: fade-up 0.8s 1s forwards;
+        }
+
+        .hero-cta::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: var(--g);
+            transform: translateX(-101%);
+            transition: transform 0.3s cubic-bezier(0.4,0,0.2,1);
+            z-index: -1;
+        }
+
+        .hero-cta:hover { color: #000; border-color: var(--g); box-shadow: 0 0 30px rgba(74,222,128,0.3); }
+        .hero-cta:hover::before { transform: translateX(0); }
+
+        .hero-scroll {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            opacity: 0;
+            animation: fade-up 0.8s 1.4s forwards;
+        }
+
+        .hero-scroll span {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 3px;
+            color: var(--text-dim);
+        }
+
+        .scroll-line {
+            width: 1px;
+            height: 40px;
+            background: linear-gradient(to bottom, var(--g), transparent);
+            animation: scroll-drop 1.5s ease-in-out infinite;
+        }
+
+        @keyframes scroll-drop {
+            0%   { transform: scaleY(0); transform-origin: top; }
+            50%  { transform: scaleY(1); transform-origin: top; }
+            51%  { transform: scaleY(1); transform-origin: bottom; }
+            100% { transform: scaleY(0); transform-origin: bottom; }
+        }
+
+        @keyframes fade-up {
+            from { opacity: 0; transform: translateY(24px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* ─── SECTION WRAPPER ─── */
+        .section {
+            position: relative;
+            z-index: 2;
+            padding: 100px 60px;
+            max-width: 1440px;
+            margin: 0 auto;
+        }
+
+        .section-label {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 4px;
+            color: var(--c);
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .section-title {
+            font-family: 'Orbitron', monospace;
+            font-size: 28px;
+            font-weight: 700;
+            color: #fff;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            margin-bottom: 56px;
+        }
+
+        /* ─── CARDS ─── */
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        @media (max-width: 960px) { .cards-grid { grid-template-columns: 1fr; } }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            padding: 36px 32px;
+            position: relative;
+            overflow: hidden;
+            transition: border-color 0.3s, transform 0.3s, box-shadow 0.3s;
+            cursor: default;
+        }
+
+        .card::after {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, var(--g), var(--c));
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.4s cubic-bezier(0.4,0,0.2,1);
+        }
+
+        .card:hover { border-color: rgba(74,222,128,0.4); transform: translateY(-4px); box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 30px var(--glow); }
+        .card:hover::after { transform: scaleX(1); }
+
+        .card-num {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 11px;
+            color: var(--g);
+            opacity: 0.5;
+            letter-spacing: 2px;
+            margin-bottom: 20px;
+        }
+
+        .card-title {
+            font-family: 'Orbitron', monospace;
+            font-size: 14px;
+            font-weight: 600;
+            color: #fff;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+            margin-bottom: 14px;
+        }
+
+        .card-desc {
+            font-size: 14px;
+            font-weight: 400;
+            line-height: 1.7;
+            color: var(--text-dim);
+        }
+
+        /* ─── DIVIDER ─── */
+        .divider {
+            position: relative;
+            z-index: 2;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--border), transparent);
+            margin: 0 60px;
+        }
+
+        /* ─── SIMULATION SECTION ─── */
+        .sim-section {
+            position: relative;
+            z-index: 2;
+            padding: 100px 60px;
+            background: rgba(8,13,22,0.6);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sim-inner { max-width: 1440px; margin: 0 auto; }
+
+        /* Metrics strip */
+        .metrics-strip {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 2px;
+            margin-bottom: 40px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+        }
+
+        @media (max-width: 900px) { .metrics-strip { grid-template-columns: repeat(2, 1fr); } }
+
+        .metric-block {
+            background: var(--card);
+            padding: 28px 24px;
+            text-align: center;
+            position: relative;
+            transition: background 0.3s;
+        }
+
+        .metric-block:hover { background: rgba(74,222,128,0.04); }
+
+        .metric-block + .metric-block::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 15%; bottom: 15%;
+            width: 1px;
+            background: var(--border);
+        }
+
+        .metric-val {
+            font-family: 'Orbitron', monospace;
+            font-size: 42px;
+            font-weight: 700;
+            color: var(--g);
+            line-height: 1;
+            margin-bottom: 10px;
+            text-shadow: 0 0 30px rgba(74,222,128,0.4);
+            transition: all 0.5s ease;
+        }
+
+        .metric-val.loading {
+            color: var(--text-dim);
+            font-size: 28px;
+        }
+
+        .metric-val sup { font-size: 18px; font-weight: 400; vertical-align: super; }
+
+        .metric-lbl {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 2.5px;
+            color: var(--text-dim);
+            text-transform: uppercase;
+        }
+
+        /* config label under metrics */
+        .metrics-config-label {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 3px;
+            color: var(--text-dim);
+            text-align: center;
+            margin-top: -30px;
+            margin-bottom: 40px;
+            text-transform: uppercase;
+        }
+
+        /* Sim layout */
+        .sim-layout {
+            display: grid;
+            grid-template-columns: 1fr 360px;
+            gap: 24px;
+        }
+
+        @media (max-width: 1100px) { .sim-layout { grid-template-columns: 1fr; } }
+
+        .sim-viewport {
+            background: #000;
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+            min-height: 580px;
+        }
+
+        .sim-viewport::before {
+            content: 'LIVE FEED';
+            position: absolute;
+            top: 16px; left: 16px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 3px;
+            color: var(--g);
+            z-index: 5;
+            opacity: 0.7;
+        }
+
+        .sim-viewport::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to bottom, rgba(74,222,128,0.03) 0%, transparent 30%);
+            pointer-events: none;
+            z-index: 4;
+        }
+
+        #stream {
+            width: 100%;
+            min-height: 580px;
+            display: block;
+            object-fit: fill;
+            background: #000;
+        }
+
+        /* Scanline effect on viewport */
+        .sim-viewport .scan {
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent,
+                transparent 2px,
+                rgba(0,0,0,0.08) 2px,
+                rgba(0,0,0,0.08) 4px
+            );
+            pointer-events: none;
+            z-index: 6;
+        }
+
+        /* Sidebar */
+        .sim-sidebar { display: flex; flex-direction: column; gap: 16px; }
+
+        .panel {
+            background: var(--card);
+            border: 1px solid var(--border);
+            padding: 24px;
+        }
+
+        .panel-head {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 3px;
+            color: var(--c);
+            text-transform: uppercase;
+            margin-bottom: 18px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-c);
+        }
+
+        /* Status badge */
+        .status-badge {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 14px;
+            font-family: 'Orbitron', monospace;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 3px;
+            margin-bottom: 20px;
+            transition: all 0.3s;
+        }
+
+        .status-badge.stopped {
+            background: rgba(239,68,68,0.08);
+            border: 1px solid rgba(239,68,68,0.4);
+            color: #ef4444;
+        }
+
+        .status-badge.running {
+            background: var(--glow);
+            border: 1px solid rgba(74,222,128,0.4);
+            color: var(--g);
+        }
+
+        .status-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .status-badge.running .status-dot {
+            box-shadow: 0 0 8px var(--g);
+            animation: pulse-dot 1.5s infinite;
+        }
+
+        /* Config select */
+        .config-label {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 9px;
+            letter-spacing: 3px;
+            color: var(--text-dim);
+            display: block;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+
+        .config-select {
+            width: 100%;
+            padding: 12px 14px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: #c8d8e8;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            outline: none;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+
+        .config-select:focus { border-color: var(--g); }
+
+        /* Info rows */
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            font-size: 13px;
+        }
+
+        .info-row:last-child { border-bottom: none; }
+
+        .info-lbl {
+            color: var(--text-dim);
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 1px;
+        }
+
+        .info-val {
+            color: var(--g);
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        /* Buttons */
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: 1px solid transparent;
+            font-family: 'Orbitron', monospace;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 2.5px;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: all 0.25s;
+            margin-bottom: 10px;
+        }
+
+        .btn:last-child { margin-bottom: 0; }
+
+        .btn-start {
+            background: var(--g);
+            border-color: var(--g);
+            color: #000;
+        }
+
+        .btn-start:hover { background: #fff; border-color: #fff; box-shadow: 0 0 20px rgba(74,222,128,0.3); }
+
+        .btn-pause {
+            background: transparent;
+            border-color: rgba(239,68,68,0.5);
+            color: #ef4444;
+        }
+
+        .btn-pause:hover { background: rgba(239,68,68,0.1); border-color: #ef4444; }
+
+        .btn-reset {
+            background: transparent;
+            border-color: var(--border);
+            color: var(--text-dim);
+        }
+
+        .btn-reset:hover { border-color: var(--c); color: var(--c); }
+
+        /* ─── FOOTER ─── */
+        .footer {
+            position: relative;
+            z-index: 2;
+            padding: 40px 60px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .footer-copy {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 2px;
+            color: var(--text-dim);
+        }
+
+        .footer-tag {
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 10px;
+            letter-spacing: 2px;
+            color: var(--g);
+            opacity: 0.5;
+        }
+
+        /* ─── COORDINATE GRID OVERLAY ON HERO ─── */
+        .hero-grid {
+            position: absolute;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(74,222,128,0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(74,222,128,0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+            z-index: 1;
+            pointer-events: none;
+        }
+
+        /* ─── SECTION DARK BACKGROUND ─── */
+        .bg-dark {
+            background: rgba(5,8,15,0.5);
+            position: relative;
+            z-index: 2;
+        }
+    </style>
+</head>
+<body>
+
+<!-- Animated swarm canvas -->
+<canvas id="swarm-canvas"></canvas>
+
+<!-- ── NAV ── -->
+<nav class="nav">
+    <div class="logo">
+        <img src="logo.png" alt="NASQ">
+        <div class="logo-text">
+            <div class="logo-name">NASQ</div>
+            <div class="logo-sub">Defense Systems</div>
+        </div>
+    </div>
+    <div class="nav-status">
+        <div class="nav-dot"></div>
+        SYSTEM ONLINE
+    </div>
+</nav>
+
+<!-- ── HERO ── -->
+<section class="hero">
+    <div class="hero-grid"></div>
+    <div class="hero-eyebrow">Multi-Agent Deep Reinforcement Learning</div>
+    <h1 class="hero-title">
+        DECENTRALIZED
+        <span class="accent">UAV SWARM</span>
+        INTELLIGENCE
+    </h1>
+    <p class="hero-desc">
+        Distributed intelligence. Real-time decisions.<br>
+        Autonomous coordination without centralized control.
+    </p>
+    <a href="#simulation" class="hero-cta">
+        <span>↓</span> VIEW SIMULATION
+    </a>
+    <div class="hero-scroll">
+        <span>SCROLL</span>
+        <div class="scroll-line"></div>
+    </div>
+</section>
+
+<!-- ── MISSION SCENARIOS ── -->
+<div class="divider"></div>
+<section class="section bg-dark">
+    <div class="section-label">// 01 — DEPLOYMENT CONTEXT</div>
+    <h2 class="section-title">Mission Scenarios</h2>
+    <div class="cards-grid">
+        <div class="card">
+            <div class="card-num">OBJ_001</div>
+            <h3 class="card-title">Urban Defense</h3>
+            <p class="card-desc">Dense urban environment with complex, dynamic obstacle patterns. Swarm navigates without pre-programmed paths.</p>
+        </div>
+        <div class="card">
+            <div class="card-num">OBJ_002</div>
+            <h3 class="card-title">Border Security</h3>
+            <p class="card-desc">Long-range surveillance and perimeter monitoring. Distributed agents maintain coverage with no single failure point.</p>
+        </div>
+        <div class="card">
+            <div class="card-num">OBJ_003</div>
+            <h3 class="card-title">Autonomous Navigation</h3>
+            <p class="card-desc">GPS-denied environment pathfinding. Each UAV reasons from local observations and learned cooperative policy.</p>
+        </div>
+    </div>
+</section>
+
+<!-- ── CAPABILITIES ── -->
+<div class="divider"></div>
+<section class="section">
+    <div class="section-label">// 02 — TECHNICAL CAPABILITIES</div>
+    <h2 class="section-title">Key Capabilities</h2>
+    <div class="cards-grid">
+        <div class="card">
+            <div class="card-num">CAP_001</div>
+            <h3 class="card-title">Decentralized Control</h3>
+            <p class="card-desc">No single point of failure. Each UAV makes autonomous decisions based solely on local observations and trained MADDPG policy.</p>
+        </div>
+        <div class="card">
+            <div class="card-num">CAP_002</div>
+            <h3 class="card-title">Real-Time Avoidance</h3>
+            <p class="card-desc">Multi-agent reinforcement learning enables instant collision and obstacle avoidance without pre-programmed trajectories.</p>
+        </div>
+        <div class="card">
+            <div class="card-num">CAP_003</div>
+            <h3 class="card-title">Swarm Coordination</h3>
+            <p class="card-desc">Emergent collective behavior through distributed intelligence. Seamless formation and mission adaptation across all agents.</p>
+        </div>
+    </div>
+</section>
+
+<!-- ── SIMULATION ── -->
+<div id="simulation" class="sim-section">
+    <div class="sim-inner">
+        <div class="section-label">// 03 — LIVE SIMULATION</div>
+        <h2 class="section-title">Simulation Results</h2>
+
+        <!-- Metrics strip — always visible, shows values on pause -->
+        <div class="metrics-strip">
+            <div class="metric-block">
+                <div class="metric-val loading" id="collision-avoidance">—</div>
+                <div class="metric-lbl">Collision Avoidance</div>
+            </div>
+            <div class="metric-block">
+                <div class="metric-val loading" id="swarm-coordination">—</div>
+                <div class="metric-lbl">Swarm Coordination</div>
+            </div>
+            <div class="metric-block">
+                <div class="metric-val loading" id="mission-success">—</div>
+                <div class="metric-lbl">Mission Success Rate</div>
+            </div>
+            <div class="metric-block">
+                <div class="metric-val loading" id="response-time">—</div>
+                <div class="metric-lbl">Avg Mission Time (s)</div>
+            </div>
+        </div>
+        <div class="metrics-config-label" id="metrics-config-label">
+            SELECT A CONFIGURATION AND PAUSE TO SEE RESULTS
+        </div>
+
+        <div class="sim-layout">
+            <!-- Video feed -->
+            <div class="sim-viewport">
+                <div class="scan"></div>
+                <img id="stream" alt="Simulation Feed">
+            </div>
+
+            <!-- Sidebar -->
+            <div class="sim-sidebar">
+
+                <!-- Status + config -->
+                <div class="panel">
+                    <div class="panel-head">System Status</div>
+                    <div id="status" class="status-badge stopped">
+                        <div class="status-dot"></div>
+                        STOPPED
+                    </div>
+                    <label class="config-label">Configuration</label>
+                    <select id="obstacle-select" class="config-select">
+                        <option value="2">Simple — 2 Obstacles</option>
+                        <option value="3">Moderate — 3 Obstacles</option>
+                        <option value="4" selected>Complex — 4 Obstacles</option>
+                    </select>
+                </div>
+
+                <!-- Episode info -->
+                <div class="panel">
+                    <div class="panel-head">Episode Info</div>
+                    <div class="info-row">
+                        <span class="info-lbl">Episodes Completed</span>
+                        <span class="info-val" id="episodes">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-lbl">Success Rate</span>
+                        <span class="info-val" id="success">—</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-lbl">Current Step</span>
+                        <span class="info-val" id="step">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-lbl">Active Obstacles</span>
+                        <span class="info-val" id="obstacles">4</span>
+                    </div>
+                </div>
+
+                <!-- Controls -->
+                <div class="panel">
+                    <div class="panel-head">Controls</div>
+                    <button class="btn btn-start"  onclick="startSim()">▶ START SIMULATION</button>
+                    <button class="btn btn-pause"  onclick="stopSim()">⏸ PAUSE SIMULATION</button>
+                    <button class="btn btn-reset"  onclick="resetStats()">↺ RESET STATISTICS</button>
+                </div>
+
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ── FOOTER ── -->
+<footer class="footer">
+    <div class="footer-copy">© 2025 NASQ DEFENSE SYSTEMS</div>
+    <div class="footer-tag">MADDPG // UAV SWARM // GP2</div>
+</footer>
+
+<!-- ══════════════════════════════════
+     SCRIPTS
+══════════════════════════════════ -->
+<script>
+// ── Swarm canvas animation ──────────────────────────────────────────
+(function() {
+    const canvas = document.getElementById('swarm-canvas');
+    const ctx    = canvas.getContext('2d');
+    let W, H;
+
+    function resize() {
+        W = canvas.width  = window.innerWidth;
+        H = canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    const COUNT   = 28;
+    const SPEED   = 0.35;
+    const CONNECT = 140;
+
+    const nodes = Array.from({length: COUNT}, () => ({
+        x: Math.random() * window.innerWidth,
+        y: Math.random() * window.innerHeight,
+        vx: (Math.random() - 0.5) * SPEED,
+        vy: (Math.random() - 0.5) * SPEED,
+        r:  Math.random() * 1.5 + 1,
+    }));
+
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        for (const n of nodes) {
+            n.x += n.vx;
+            n.y += n.vy;
+            if (n.x < 0 || n.x > W) n.vx *= -1;
+            if (n.y < 0 || n.y > H) n.vy *= -1;
+        }
+        for (let i = 0; i < COUNT; i++) {
+            for (let j = i + 1; j < COUNT; j++) {
+                const dx   = nodes[i].x - nodes[j].x;
+                const dy   = nodes[i].y - nodes[j].y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < CONNECT) {
+                    const alpha = (1 - dist / CONNECT) * 0.25;
+                    ctx.strokeStyle = `rgba(74,222,128,${alpha})`;
+                    ctx.lineWidth   = 0.6;
+                    ctx.beginPath();
+                    ctx.moveTo(nodes[i].x, nodes[i].y);
+                    ctx.lineTo(nodes[j].x, nodes[j].y);
+                    ctx.stroke();
+                }
+            }
+        }
+        for (const n of nodes) {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(74,222,128,0.6)';
+            ctx.fill();
+        }
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+
+// ── Backend logic ───────────────────────────────────────────────────
+const BACKEND = 'https://maddpg-backend-production.up.railway.app';
+
+// Config labels matching the obstacle count
+const CONFIG_LABELS = {
+    2: 'SIMPLE ENVIRONMENT — 2 OBSTACLES',
+    3: 'MODERATE ENVIRONMENT — 3 OBSTACLES',
+    4: 'COMPLEX ENVIRONMENT — 4 OBSTACLES',
+};
+
+const streamEl = document.getElementById('stream');
+streamEl.src = `${BACKEND}/video_feed`;
+
+function setMetric(id, val, suffix) {
+    const el = document.getElementById(id);
+    if (val === null || val === undefined) {
+        el.textContent = '—';
+        el.classList.add('loading');
+    } else {
+        el.textContent = val.toFixed(1) + (suffix || '');
+        el.classList.remove('loading');
+    }
+}
+
+function updateMetrics() {
+    fetch(`${BACKEND}/metrics`)
+        .then(r => r.json())
+        .then(data => {
+            const running  = data.running;
+            const numObs   = data.num_obstacles || 4;
+
+            // ── Status badge ──
+            const statusEl = document.getElementById('status');
+            if (running) {
+                statusEl.className = 'status-badge running';
+                statusEl.innerHTML = '<div class="status-dot"></div> RUNNING';
+            } else {
+                statusEl.className = 'status-badge stopped';
+                statusEl.innerHTML = '<div class="status-dot"></div> PAUSED';
+            }
+
+            // ── Episode info — always visible ──
+            document.getElementById('episodes').textContent  = data.episodes || 0;
+            document.getElementById('step').textContent      = data.current_step || 0;
+            document.getElementById('obstacles').textContent = numObs;
+
+            // ── Success rate in sidebar — always show from config ──
+            const successEl = document.getElementById('success');
+            if (data.success_rate) {
+                successEl.textContent = data.success_rate.toFixed(1) + '%';
+            } else {
+                successEl.textContent = '—';
+            }
+
+            // ── Top metric cards ──
+            // Show values when paused; show dashes while running so they
+            // don't distract from the live feed
+            if (!running) {
+                setMetric('collision-avoidance', data.collision_avoidance, '%');
+                setMetric('swarm-coordination',  data.swarm_coordination,  '%');
+                setMetric('mission-success',     data.success_rate,        '%');
+                setMetric('response-time',       data.avg_response_time,   's');
+
+                // Update the label below the metrics strip
+                document.getElementById('metrics-config-label').textContent =
+                    CONFIG_LABELS[numObs] || '';
+            } else {
+                // Running — keep metric cards blank so viewer focuses on sim
+                ['collision-avoidance','swarm-coordination','mission-success','response-time']
+                    .forEach(id => {
+                        const el = document.getElementById(id);
+                        el.textContent = '—';
+                        el.classList.add('loading');
+                    });
+                document.getElementById('metrics-config-label').textContent =
+                    'SIMULATION RUNNING — PAUSE TO VIEW RESULTS';
+            }
+        })
+        .catch(() => {
+            // Backend unreachable — don't crash
+        });
+}
+
+function startSim() {
+    fetch(`${BACKEND}/start`, { method: 'POST' })
+        .catch(err => console.error('Start failed:', err));
+}
+
+function stopSim() {
+    fetch(`${BACKEND}/stop`, { method: 'POST' })
+        .then(() => updateMetrics())   // refresh immediately on pause
+        .catch(err => console.error('Stop failed:', err));
+}
+
+function resetStats() {
+    fetch(`${BACKEND}/reset_stats`, { method: 'POST' })
+        .catch(err => console.error('Reset failed:', err));
+}
+
+document.getElementById('obstacle-select').addEventListener('change', function(e) {
+    const n = parseInt(e.target.value);
+    fetch(`${BACKEND}/stop`, { method: 'POST' })
+        .then(() => fetch(`${BACKEND}/set_obstacles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ num_obstacles: n })
+        }))
+        .then(r => r.json())
+        .then(() => updateMetrics())   // refresh metrics for new config
+        .catch(err => console.error('Config change error:', err));
+});
+
+setInterval(updateMetrics, 500);
+updateMetrics();
+</script>
+</body>
+</html>
