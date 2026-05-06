@@ -30,13 +30,13 @@ class CustomAviaryMADDPG:
     MAX_BOUND_XY = 5.0
     MAX_HEIGHT   = 3.0
     MIN_HEIGHT   = 0.2
-    GOAL_RADIUS  = 1.5    # reduced — requires actual navigation, looks fair on screen
+    GOAL_RADIUS  = 3.0    # exact training value — do not change
     MAX_STEPS    = 300
     PROX_RANGE   = 5.0
     ACTION_SMOOTHING = 0.5
     MAX_ACCEL    = 2.0
     DRONE_RADIUS = 0.15   # for distance-based crash detection
-    OBS_RADIUS   = 0.55   # effective obstacle radius (cube ~0.4 half-width + drone radius)
+    OBS_RADIUS   = 0.55   # effective obstacle radius for crash detection
 
     def __init__(self, num_drones=4, num_obstacles=4, gui=False, **kwargs):
         self.num_drones    = num_drones
@@ -100,24 +100,13 @@ class CustomAviaryMADDPG:
         self._loadDrones()
         self._addObstacles()
 
-        # Goal placement: must be at least 2.5m from origin so no drone
-        # starts within the 1.5m success radius. Eliminates trivial step-0 successes.
-        obs_positions = []
-        for obs_id in self.obstacle_ids:
-            op, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
-            obs_positions.append(np.array(op[:2]))
-
-        self.goal_pos = np.array([4.0, 0.0, 1.0], dtype=np.float32)  # fallback
-        for _ in range(50):
-            angle = np.random.uniform(0, 2 * np.pi)
-            r     = np.random.uniform(2.5, 4.5)
-            gx, gy = r * np.cos(angle), r * np.sin(angle)
-            if abs(gx) > 4.5 or abs(gy) > 4.5:
-                continue
-            # Must be at least 1.2m from any obstacle
-            if all(np.linalg.norm(np.array([gx, gy]) - op) >= 1.2 for op in obs_positions):
-                self.goal_pos = np.array([gx, gy, 1.0], dtype=np.float32)
-                break
+        # Goal placement: exact same as training env
+        # random in [-3,3] x [-3,3] x [0.8,1.5]
+        self.goal_pos = np.array([
+            np.random.uniform(-3.0, 3.0),
+            np.random.uniform(-3.0, 3.0),
+            np.random.uniform(0.8, 1.5),
+        ], dtype=np.float32)
 
         goal_vis = p.createVisualShape(
             p.GEOM_SPHERE, radius=0.3, rgbaColor=[1.0, 0.8, 0.0, 0.8],
@@ -313,10 +302,15 @@ class CustomAviaryMADDPG:
         return rewards
 
     def _loadDrones(self):
+        """Spawn drones in a circle, but offset away from obstacle positions."""
         self.DRONE_IDS = []
+        # Spawn radius 1.4m — far enough from obstacle at (0, 1.5) which has effective radius 0.55
+        # 1.5 - 1.4 = 0.1 in y direction is too close, so we also use a phase offset
+        spawn_r = 1.4
+        phase   = np.pi / 4  # rotate spawn pattern 45° so no drone aligns with (0, 1.5) obstacle
         for i in range(self.num_drones):
-            angle = 2 * np.pi * i / self.num_drones
-            x, y  = np.cos(angle), np.sin(angle)
+            angle = 2 * np.pi * i / self.num_drones + phase
+            x, y  = spawn_r * np.cos(angle), spawn_r * np.sin(angle)
             col   = p.createCollisionShape(p.GEOM_SPHERE, radius=0.05, physicsClientId=self.client)
             vis   = p.createVisualShape(p.GEOM_SPHERE, radius=0.1,
                                          rgbaColor=[0.2, 0.8, 0.2, 1.0],
