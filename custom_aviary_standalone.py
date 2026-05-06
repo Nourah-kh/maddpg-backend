@@ -1,9 +1,16 @@
 """
-custom_aviary_standalone.py — MADDPG Environment without Ray dependency
-=========================================================================
-Standalone version for deployment that doesn't require Ray/RLlib
+custom_aviary_standalone.py — MADDPG Deployment Environment
+============================================================
+Matches the training environment (custom_aviary_maddpg.py) exactly:
+  - Observations normalized identically (pos/5, vel/MAX_SPEED, rpy/pi, proximity/5, rel_goal/5)
+  - Actions applied via resetBaseVelocity (not position delta)
+  - 5 physics substeps per control step (PYB_FREQ=240, CTRL_FREQ=48)
+  - Action smoothing (0.5 blend with previous command)
+  - Goal radius = 3.0m, all drones within it = success
+  - Termination on crash, out-of-bounds, height violation, or success
 """
 
+import os
 import numpy as np
 import pybullet as p
 import pybullet_data
@@ -11,241 +18,327 @@ from gymnasium import spaces
 
 
 class CustomAviaryMADDPG:
-    """MADDPG UAV environment - standalone version for deployment"""
-    
-    def __init__(self, num_drones=4, obs_radius=0.3, act_radius=0.3, num_obstacles=4, gui=False, record=False):
-        self.num_drones = num_drones
-        self.obs_radius = obs_radius
-        self.act_radius = act_radius
+    """Standalone MADDPG UAV environment — matches training env exactly."""
+
+    PYB_FREQ           = 240
+    CTRL_FREQ          = 48
+    PYB_STEPS_PER_CTRL = PYB_FREQ // CTRL_FREQ   # = 5
+    CTRL_TIMESTEP      = 1.0 / CTRL_FREQ
+
+    MAX_SPEED    = 1.0
+    MAX_YAW_RATE = 1.0
+    MAX_BOUND_XY = 5.0
+    MAX_HEIGHT   = 3.0
+    MIN_HEIGHT   = 0.2
+    GOAL_RADIUS  = 3.0
+    MAX_STEPS    = 300
+    PROX_RANGE   = 5.0
+    ACTION_SMOOTHING = 0.5
+    MAX_ACCEL    = 2.0
+
+    def __init__(self, num_drones=4, num_obstacles=4, gui=False, **kwargs):
+        self.num_drones    = num_drones
         self.num_obstacles = num_obstacles
-        self.gui = gui
-        
-        # PyBullet setup
-        if gui:
-            self.client = p.connect(p.GUI)
-        else:
-            self.client = p.connect(p.DIRECT)
-        
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setGravity(0, 0, -9.81)
-        
-        # Load plane
-        self.plane_id = p.loadURDF("plane.urdf")
-        
-        # Observation and action spaces (per drone)
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32
-        )
+        self.gui           = gui
+
+        self.client = p.connect(p.GUI if gui else p.DIRECT)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self.client)
+        p.setGravity(0, 0, -9.8, physicsClientId=self.client)
+        p.setTimeStep(1.0 / self.PYB_FREQ, physicsClientId=self.client)
+
+        lo = np.array([-1.]*3 + [-1.]*3 + [-1.]*3 + [0.] + [-1.]*3, dtype=np.float32)
+        hi = np.ones(13, dtype=np.float32)
+        self.observation_space = spaces.Box(low=lo, high=hi, dtype=np.float32)
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(4,), dtype=np.float32
+            low=np.array([-self.MAX_SPEED]*3 + [-self.MAX_YAW_RATE], dtype=np.float32),
+            high=np.array([+self.MAX_SPEED]*3 + [+self.MAX_YAW_RATE], dtype=np.float32),
         )
-        
-        # State
-        self.drone_ids = []
-        self.obstacle_ids = []
-        self.goal_id = None  # Track goal body for cleanup
-        self.goal_position = None
-        self.step_count = 0
-        self.crashed = [False] * num_drones  # collision flags per drone
-        self.goal_reached = False
-        
+
+        self.DRONE_IDS       = []
+        self.obstacle_ids    = []
+        self.goal_id         = None
+        self.goal_pos        = np.zeros(3, dtype=np.float32)
+        self.step_counter    = 0
+        self.crashed         = np.zeros(num_drones, dtype=bool)
+        self.crash_type      = [None] * num_drones
+        self.prev_cmd        = np.zeros((num_drones, 4), dtype=np.float32)
+        self.is_success      = False
+        self.is_collision    = False
+        self.mission_time    = 0
+        self._prev_dist      = {}
+        self._last_valid_obs = {}
+        self.goal_reached    = False
+
+    # ──────────────────────────────────────────────────────────────
+    # reset
+    # ──────────────────────────────────────────────────────────────
+
     def reset(self, seed=None):
-        """Reset environment"""
-        # Remove old drones/obstacles/goal
-        for drone_id in self.drone_ids:
-            p.removeBody(drone_id)
+        if seed is not None:
+            np.random.seed(seed)
+
+        p.resetSimulation(physicsClientId=self.client)
+        p.setGravity(0, 0, -9.8, physicsClientId=self.client)
+        p.setTimeStep(1.0 / self.PYB_FREQ, physicsClientId=self.client)
+        p.loadURDF("plane.urdf", physicsClientId=self.client)
+
+        self.DRONE_IDS       = []
+        self.obstacle_ids    = []
+        self.goal_id         = None
+        self.step_counter    = 0
+        self.crashed         = np.zeros(self.num_drones, dtype=bool)
+        self.crash_type      = [None] * self.num_drones
+        self.prev_cmd        = np.zeros((self.num_drones, 4), dtype=np.float32)
+        self.is_success      = False
+        self.is_collision    = False
+        self.mission_time    = 0
+        self._last_valid_obs = {}
+        self.goal_reached    = False
+
+        self._loadDrones()
+        self._addObstacles()
+
+        # Safe goal candidates — shuffled each episode
+        candidates = [
+            np.array([ 0.0,  2.5, 1.0], dtype=np.float32),
+            np.array([ 0.0, -2.5, 1.0], dtype=np.float32),
+            np.array([ 2.0,  2.0, 1.0], dtype=np.float32),
+            np.array([-2.0,  2.0, 1.0], dtype=np.float32),
+            np.array([-2.0, -2.0, 1.0], dtype=np.float32),
+            np.array([ 2.0, -2.0, 1.0], dtype=np.float32),
+        ]
+        obs_positions = []
         for obs_id in self.obstacle_ids:
-            p.removeBody(obs_id)
-        if self.goal_id is not None:
-            p.removeBody(self.goal_id)
-        
-        self.drone_ids = []
-        self.obstacle_ids = []
-        self.goal_id = None
-        self.step_count = 0
-        self.crashed = [False] * self.num_drones
-        self.goal_reached = False
-        
-        # Spawn drones clustered near origin
+            op, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
+            obs_positions.append(np.array(op))
+
+        np.random.shuffle(candidates)
+        self.goal_pos = candidates[0]
+        for c in candidates:
+            if all(np.linalg.norm(c[:2] - op[:2]) >= 1.2 for op in obs_positions):
+                self.goal_pos = c
+                break
+
+        goal_vis = p.createVisualShape(
+            p.GEOM_SPHERE, radius=0.3, rgbaColor=[1.0, 0.8, 0.0, 0.8],
+            physicsClientId=self.client
+        )
+        self.goal_id = p.createMultiBody(
+            baseMass=0, baseVisualShapeIndex=goal_vis,
+            basePosition=self.goal_pos.tolist(), physicsClientId=self.client
+        )
+
         for i in range(self.num_drones):
-            x = np.random.uniform(-0.3, 0.3)
-            y = np.random.uniform(-0.3, 0.3)
-            z = 0.5
-            
-            collision_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=0.1)
-            visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=0.1, rgbaColor=[0, 1, 0, 1])
-            
+            pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            self._prev_dist[f"drone_{i}"] = float(np.linalg.norm(np.array(pos) - self.goal_pos))
+
+        return self._computeObs(), {}
+
+    # ──────────────────────────────────────────────────────────────
+    # step
+    # ──────────────────────────────────────────────────────────────
+
+    def step(self, actions):
+        for i in range(self.num_drones):
+            if not self.crashed[i]:
+                key = f"drone_{i}"
+                act = actions.get(key, np.zeros(4)) if isinstance(actions, dict) else actions[i]
+                self._applyAction(np.array(act, dtype=np.float32), i)
+
+        for _ in range(self.PYB_STEPS_PER_CTRL):
+            p.stepSimulation(physicsClientId=self.client)
+
+        self._check_crashes()
+        self.step_counter += 1
+        self.mission_time  = self.step_counter
+
+        obs        = self._computeObs()
+        terminated = self._computeTerminated()
+        truncated  = self._computeTruncated()
+        rewards    = self._computeRewards()
+        info       = {"goal_reached": self.is_success, "is_collision": self.is_collision}
+
+        for i in range(self.num_drones):
+            pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            self._prev_dist[f"drone_{i}"] = float(np.linalg.norm(np.array(pos) - self.goal_pos))
+
+        return obs, rewards, terminated, truncated, info
+
+    # ──────────────────────────────────────────────────────────────
+    # Internal — match training env exactly
+    # ──────────────────────────────────────────────────────────────
+
+    def _applyAction(self, action: np.ndarray, idx: int):
+        action[0:3] = np.clip(action[0:3], -self.MAX_SPEED,    self.MAX_SPEED)
+        action[3]   = np.clip(action[3],   -self.MAX_YAW_RATE, self.MAX_YAW_RATE)
+
+        prev    = self.prev_cmd[idx].copy()
+        max_dv  = self.MAX_ACCEL * self.CTRL_TIMESTEP
+        dv      = np.clip(action[0:3] - prev[0:3], -max_dv, max_dv)
+
+        limited        = prev.copy()
+        limited[0:3]   = prev[0:3] + dv
+        limited[3]     = action[3]
+
+        smoothed = self.ACTION_SMOOTHING * prev + (1.0 - self.ACTION_SMOOTHING) * limited
+        smoothed = np.nan_to_num(smoothed, nan=0., posinf=1., neginf=-1.)
+
+        p.resetBaseVelocity(
+            self.DRONE_IDS[idx],
+            linearVelocity=smoothed[0:3].tolist(),
+            angularVelocity=[0., 0., float(smoothed[3])],
+            physicsClientId=self.client
+        )
+        self.prev_cmd[idx] = smoothed
+
+    def _computeObs(self) -> dict:
+        obs = {}
+        for i in range(self.num_drones):
+            aid       = f"drone_{i}"
+            pos, quat = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            vel, _    = p.getBaseVelocity(self.DRONE_IDS[i], physicsClientId=self.client)
+            rpy       = p.getEulerFromQuaternion(quat)
+
+            min_d     = self._get_min_dist(i)
+            proximity = float(np.clip(min_d / self.PROX_RANGE, 0.0, 1.0))
+            rel_goal  = np.clip((self.goal_pos - np.array(pos)) / 5.0, -1., 1.)
+
+            own_obs = np.concatenate([
+                np.clip(np.array(pos) / 5.0,            -1., 1.),
+                np.clip(np.array(vel) / self.MAX_SPEED, -1., 1.),
+                np.clip(np.array(rpy) / np.pi,          -1., 1.),
+                np.array([proximity]),
+                rel_goal,
+            ]).astype(np.float32)
+
+            if np.any(np.isnan(own_obs)) or np.any(np.isinf(own_obs)):
+                own_obs = self._last_valid_obs.get(aid, np.zeros(13, dtype=np.float32))
+            else:
+                self._last_valid_obs[aid] = own_obs.copy()
+
+            obs[aid] = own_obs
+        return obs
+
+    def _get_min_dist(self, drone_idx: int) -> float:
+        pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[drone_idx], physicsClientId=self.client)
+        pos    = np.array(pos)
+        min_d  = float("inf")
+        for j in range(self.num_drones):
+            if j != drone_idx:
+                op, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[j], physicsClientId=self.client)
+                min_d = min(min_d, np.linalg.norm(pos - np.array(op)))
+        for obs_id in self.obstacle_ids:
+            op, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
+            min_d = min(min_d, np.linalg.norm(pos - np.array(op)))
+        return min_d if min_d < float("inf") else 0.0
+
+    def _check_crashes(self):
+        for i in range(self.num_drones):
+            if self.crashed[i]:
+                continue
+            for j in range(i + 1, self.num_drones):
+                if p.getContactPoints(self.DRONE_IDS[i], self.DRONE_IDS[j], physicsClientId=self.client):
+                    self.crashed[i] = self.crashed[j] = True
+                    self.crash_type[i] = self.crash_type[j] = "drone_collision"
+            for obs_id in self.obstacle_ids:
+                if p.getContactPoints(self.DRONE_IDS[i], obs_id, physicsClientId=self.client):
+                    self.crashed[i]    = True
+                    self.crash_type[i] = "obstacle_collision"
+
+    def _computeTerminated(self) -> dict:
+        all_keys = {f"drone_{i}": False for i in range(self.num_drones)}
+
+        if any(self.crashed):
+            self.is_collision = True
+            return {k: True for k in all_keys}
+
+        for i in range(self.num_drones):
+            pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            x, y, z = pos
+            if np.linalg.norm([x, y]) > self.MAX_BOUND_XY or z > self.MAX_HEIGHT or z < self.MIN_HEIGHT:
+                return {k: True for k in all_keys}
+
+        if all(
+            np.linalg.norm(
+                np.array(p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)[0])
+                - self.goal_pos
+            ) <= self.GOAL_RADIUS
+            for i in range(self.num_drones)
+        ):
+            self.is_success   = True
+            self.goal_reached = True
+            return {k: True for k in all_keys}
+
+        return all_keys
+
+    def _computeTruncated(self) -> dict:
+        done = self.step_counter >= self.MAX_STEPS
+        return {f"drone_{i}": done for i in range(self.num_drones)}
+
+    def _computeRewards(self) -> dict:
+        rewards = {}
+        for i in range(self.num_drones):
+            aid    = f"drone_{i}"
+            pos, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            dist   = float(np.linalg.norm(np.array(pos) - self.goal_pos))
+            prev_d = self._prev_dist.get(aid, dist)
+
+            r = 0.001
+            if self.crashed[i]:
+                r -= 50.0
+            else:
+                r += 4.0 * (prev_d - dist)
+            if dist <= self.GOAL_RADIUS:
+                r += 200.0
+            rewards[aid] = float(r)
+        return rewards
+
+    def _loadDrones(self):
+        self.DRONE_IDS = []
+        for i in range(self.num_drones):
+            angle = 2 * np.pi * i / self.num_drones
+            x, y  = np.cos(angle), np.sin(angle)
+            col   = p.createCollisionShape(p.GEOM_SPHERE, radius=0.05, physicsClientId=self.client)
+            vis   = p.createVisualShape(p.GEOM_SPHERE, radius=0.1,
+                                         rgbaColor=[0.2, 0.8, 0.2, 1.0],
+                                         physicsClientId=self.client)
             drone_id = p.createMultiBody(
                 baseMass=0.5,
-                baseCollisionShapeIndex=collision_shape,
-                baseVisualShapeIndex=visual_shape,
-                basePosition=[x, y, z]
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=[x, y, 1.0],
+                physicsClientId=self.client
             )
-            self.drone_ids.append(drone_id)
-        
-        # Spawn obstacles at fixed positions
-        if self.num_obstacles == 2:
-            obs_positions = [
-                (2.5, 0.0, 0.4),
-                (-2.5, 0.0, 0.4),
-            ]
-        elif self.num_obstacles == 3:
-            obs_positions = [
-                (2.5, 0.0, 0.4),
-                (-2.5, 0.0, 0.4),
-                (0.0, 1.5, 0.4),
-            ]
-        else:  # 4 obstacles
-            obs_positions = [
-                (2.5, 0.0, 0.4),
-                (-2.5, 0.0, 0.4),
-                (0.0, 1.5, 0.4),
-                (1.5, 2.5, 0.4),
-            ]
-        
-        for ox, oy, oz in obs_positions:
-            collision_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=self.obs_radius, height=0.5)
-            visual_shape = p.createVisualShape(p.GEOM_CYLINDER, radius=self.obs_radius, length=0.5, rgbaColor=[1, 0, 0, 1])
-            obs_id = p.createMultiBody(
-                baseMass=0,
-                baseCollisionShapeIndex=collision_shape,
-                baseVisualShapeIndex=visual_shape,
-                basePosition=[ox, oy, oz]
-            )
-            self.obstacle_ids.append(obs_id)
-        
-        # Place goal in a safe zone: fixed candidate positions away from obstacles and origin
-        safe_goal_candidates = [
-            np.array([ 0.0,  2.5, 0.5]),
-            np.array([ 0.0, -2.5, 0.5]),
-            np.array([ 2.0,  2.0, 0.5]),
-            np.array([-2.0,  2.0, 0.5]),
-            np.array([-2.0, -2.0, 0.5]),
-            np.array([ 2.0, -2.0, 0.5]),
-        ]
-        obs_pos_array = [np.array([ox, oy, oz]) for ox, oy, oz in obs_positions]
-        
-        # Pick a goal candidate that is at least 1.0m from every obstacle
-        np.random.shuffle(safe_goal_candidates)
-        self.goal_position = safe_goal_candidates[0]  # fallback
-        for candidate in safe_goal_candidates:
-            too_close = any(
-                np.linalg.norm(candidate[:2] - op[:2]) < 1.0
-                for op in obs_pos_array
-            )
-            if not too_close:
-                self.goal_position = candidate
-                break
-        
-        # Create goal marker
-        goal_visual = p.createVisualShape(p.GEOM_SPHERE, radius=0.2, rgbaColor=[1, 0.8, 0, 1])
-        self.goal_id = p.createMultiBody(
-            baseMass=0,
-            baseVisualShapeIndex=goal_visual,
-            basePosition=self.goal_position
-        )
-        
-        obs = self._get_observations()
-        return obs, {}
-    
-    def _get_observations(self):
-        """Get observations for all drones"""
-        observations = {}
-        
-        for i, drone_id in enumerate(self.drone_ids):
-            pos, orn = p.getBasePositionAndOrientation(drone_id)
-            vel, ang_vel = p.getBaseVelocity(drone_id)
-            
-            # 13D observation
-            obs = np.zeros(13, dtype=np.float32)
-            obs[0:3] = pos  # position
-            obs[3:6] = vel  # velocity
-            obs[6:9] = p.getEulerFromQuaternion(orn)  # orientation
-            
-            # Proximity: distance to nearest obstacle
-            min_dist = float('inf')
-            for obs_id in self.obstacle_ids:
-                obs_pos, _ = p.getBasePositionAndOrientation(obs_id)
-                d = np.linalg.norm(np.array(pos) - np.array(obs_pos))
-                min_dist = min(min_dist, d)
-            obs[9] = min_dist if min_dist < float('inf') else 0.0
-            
-            obs[10:13] = self.goal_position - np.array(pos)  # relative goal direction
-            
-            observations[f"drone_{i}"] = obs
-        
-        return observations
-    
-    def step(self, actions):
-        """Step environment with actions for all drones.
-        
-        actions: dict {"drone_0": array(4,), ...} OR list/array indexed by int
-        """
-        self.crashed = [False] * self.num_drones
+            self.DRONE_IDS.append(drone_id)
 
-        # Apply actions
-        for i, drone_id in enumerate(self.drone_ids):
-            drone_key = f"drone_{i}"
-            if isinstance(actions, dict):
-                action = actions.get(drone_key, actions.get(i, np.zeros(4)))
+    def _addObstacles(self):
+        self.obstacle_ids = []
+        assets    = pybullet_data.getDataPath()
+        cube_urdf = os.path.join(assets, "cube_no_rotation.urdf")
+
+        if self.num_obstacles == 2:
+            positions = [[2.5, 0., .4], [-2.5, 0., .4]]
+        elif self.num_obstacles == 3:
+            positions = [[2.5, 0., .4], [-2.5, 0., .4], [0., 1.5, .4]]
+        else:
+            positions = [[2.5, 0., .4], [-2.5, 0., .4], [0., 1.5, .4], [1.5, 2.5, .4]]
+
+        for pos in positions:
+            if os.path.exists(cube_urdf):
+                obs_id = p.loadURDF(cube_urdf, pos, globalScaling=0.8, physicsClientId=self.client)
+                p.changeDynamics(obs_id, -1, mass=0.0, physicsClientId=self.client)
             else:
-                action = actions[i]
-            
-            # Scale: action in [-1,1], move up to 0.05m per step (was 0.02 — too slow)
-            vx, vy, vz, _ = action * 0.05
-            
-            pos, orn = p.getBasePositionAndOrientation(drone_id)
-            new_pos = [
-                np.clip(pos[0] + vx, -3.5, 3.5),
-                np.clip(pos[1] + vy, -3.5, 3.5),
-                max(0.2, pos[2] + vz),
-            ]
-            p.resetBasePositionAndOrientation(drone_id, new_pos, orn)
-        
-        p.stepSimulation()
-        self.step_count += 1
-        
-        # Check collisions
-        for i, drone_id in enumerate(self.drone_ids):
-            for obs_id in self.obstacle_ids:
-                if p.getContactPoints(drone_id, obs_id):
-                    self.crashed[i] = True
-        
-        obs = self._get_observations()
-        
-        rewards = {}
-        terminated = {}
-        truncated = {}
-        
-        # Episode ends when the MAJORITY of drones reach the goal (or all crash)
-        drones_at_goal = 0
-        for i in range(self.num_drones):
-            drone_key = f"drone_{i}"
-            pos = obs[drone_key][0:3]
-            dist_to_goal = np.linalg.norm(pos - self.goal_position)
-            
-            reward = -0.01  # small penalty per step to encourage speed
-            if dist_to_goal < 0.5:
-                reward += 10.0
-                drones_at_goal += 1
-            elif dist_to_goal < 1.5:
-                reward += 1.0  # shaped reward: closer = better
-            
-            if self.crashed[i]:
-                reward -= 5.0
-            
-            rewards[drone_key] = reward
-            terminated[drone_key] = False
-            truncated[drone_key] = self.step_count >= 400
-        
-        # Episode terminates when majority (>=2 of 4) reach the goal
-        self.goal_reached = drones_at_goal >= max(1, self.num_drones // 2)
-        if self.goal_reached:
-            for key in terminated:
-                terminated[key] = True
-        
-        return obs, rewards, terminated, truncated, {"goal_reached": self.goal_reached}
-    
+                col    = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.3, height=0.8,
+                                                 physicsClientId=self.client)
+                vis    = p.createVisualShape(p.GEOM_CYLINDER, radius=0.3, length=0.8,
+                                              rgbaColor=[0.8, 0.1, 0.1, 1.0],
+                                              physicsClientId=self.client)
+                obs_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
+                                            baseVisualShapeIndex=vis, basePosition=pos,
+                                            physicsClientId=self.client)
+            self.obstacle_ids.append(obs_id)
+
     def close(self):
-        """Close PyBullet"""
-        p.disconnect(self.client)
+        if self.client >= 0:
+            p.disconnect(physicsClientId=self.client)
+            self.client = -1
