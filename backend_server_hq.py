@@ -358,7 +358,9 @@ def run_simulation():
             try:
                 obs, info = state.env.reset()
             except Exception as e:
+                import traceback
                 print(f"❌ Reset error: {e}")
+                traceback.print_exc()
                 time.sleep(0.5)
                 continue
 
@@ -411,7 +413,9 @@ def run_simulation():
                 obs = None  # triggers new episode on next iteration
 
         except Exception as e:
+            import traceback
             print(f"❌ Step error: {e}")
+            traceback.print_exc()
             obs = None
             time.sleep(0.2)
             continue
@@ -581,18 +585,13 @@ def set_obstacles():
 
     was_running = state.running
     state.running = False
-    time.sleep(0.35)  # wait for sim thread to finish current step
+    time.sleep(0.4)  # ensure sim thread has fully stopped
 
     try:
-        # Change num_obstacles on existing env — reset() will respawn with new obstacle count
-        if state.env is not None:
-            state.env.num_obstacles = num_obstacles
-        state.num_obstacles = num_obstacles
-
-        # Reload the matching checkpoint
+        # Full reinit — don't patch, create fresh env with correct obstacle count
+        state.init_environment(num_drones=4, num_obstacles=num_obstacles)
         state.load_checkpoint(checkpoint_map[num_obstacles], num_agents=4)
 
-        # Reset all counters
         state.episode_count    = 0
         state.success_count    = 0
         state.collision_count  = 0
