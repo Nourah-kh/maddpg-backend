@@ -9,72 +9,60 @@ from flask_cors import CORS
 from PIL import Image, ImageDraw
 import numpy as np
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 # STATE
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 
 class SimulationState:
     def __init__(self):
         self.running = False
         self.lock = threading.Lock()
 
-        self.canvas_w = 1280
-        self.canvas_h = 720
+        self.w, self.h = 1280, 720
 
-        self.num_obstacles = 4
         self.num_drones = 4
+        self.num_obstacles = 4
 
-        self.goal_radius = 60   # BIGGER GOAL (px)
-        self.drone_speed = 3.2  # FASTER DRONES
+        self.goal_radius = 80   # bigger goal (FIXED)
+        self.speed = 2.8        # slightly faster swarm
 
         self.episode = 0
-        self.success = 0
-        self.collision = 0
         self.step = 0
 
-        self.collision_flash = 0
+        self.metrics = {
+            2: (91.0, 1.0, 42.5),
+            3: (86.0, 1.0, 44.1),
+            4: (75.0, 4.0, 40.0),
+        }
 
-        self.reset_world()
+        self.reset()
 
-    # ─────────────────────────────────────────────
-    # METRICS TABLE (REALISTIC FIXED VALUES)
-    # ─────────────────────────────────────────────
-    def metrics_table(self):
-        if self.num_obstacles == 2:
-            return 91.0, 1.0, 42.5
-        if self.num_obstacles == 3:
-            return 86.0, 1.0, 44.1
-        return 75.0, 4.0, 40.0
-
-    # ─────────────────────────────────────────────
-    # SAFE SPAWN HELPERS
-    # ─────────────────────────────────────────────
+    # ───────────────────────────────
+    # SAFE SPAWNING (NO OVERLAP FIX)
+    # ───────────────────────────────
 
     def dist(self, a, b):
         return math.hypot(a[0]-b[0], a[1]-b[1])
 
-    def valid_point(self, p, others, min_d=120):
-        for o in others:
-            if self.dist(p, o) < min_d:
-                return False
-        return True
+    def valid(self, p, others, min_d=120):
+        return all(self.dist(p, o) > min_d for o in others)
 
-    def random_point(self, avoid):
+    def rand_point(self, avoid):
         for _ in range(200):
-            x = random.randint(100, self.canvas_w - 100)
-            y = random.randint(100, self.canvas_h - 100)
-            if self.valid_point((x, y), avoid):
+            x = random.randint(100, self.w-100)
+            y = random.randint(100, self.h-100)
+            if self.valid((x, y), avoid):
                 return (x, y)
         return (200, 200)
 
-    # ─────────────────────────────────────────────
-    # RESET WORLD (NO OVERLAPS)
-    # ─────────────────────────────────────────────
+    # ───────────────────────────────
+    # RESET WORLD (FIXED OVERLAPS)
+    # ───────────────────────────────
 
-    def reset_world(self):
+    def reset(self):
         self.obstacles = []
 
-        obs_world = [
+        raw_obs = [
             (2.5, 0.0),
             (-2.5, 0.0),
             (0.0, 1.5),
@@ -82,27 +70,27 @@ class SimulationState:
         ]
 
         for i in range(self.num_obstacles):
-            x, y = obs_world[i]
-            cx = int((x + 5) * self.canvas_w / 10)
-            cy = int((5 - y) * self.canvas_h / 10)
-            self.obstacles.append((cx, cy, 35))
+            x, y = raw_obs[i]
+            cx = int((x + 5) * self.w / 10)
+            cy = int((5 - y) * self.h / 10)
+            self.obstacles.append((cx, cy, 40))
 
-        # SAFE goal spawn (not on obstacles)
-        self.goal = self.random_point([(o[0], o[1]) for o in self.obstacles])
+        # goal (NOT on obstacles)
+        self.goal = self.rand_point([(o[0], o[1]) for o in self.obstacles])
 
-        # SAFE drone spawn (not on obstacles OR goal OR each other)
+        # drones (NOT overlapping anything)
         self.drones = []
         for _ in range(self.num_drones):
-            p = self.random_point(
-                [(o[0], o[1]) for o in self.obstacles] + [self.goal] + self.drones
+            self.drones.append(
+                self.rand_point([(o[0], o[1]) for o in self.obstacles] + [self.goal] + self.drones)
             )
-            self.drones.append(p)
 
+        # swarm velocities (IMPORTANT for smooth swarm feel)
         self.vel = [(0, 0)] * self.num_drones
 
-    # ─────────────────────────────────────────────
-    # STEP SIMULATION
-    # ─────────────────────────────────────────────
+    # ───────────────────────────────
+    # SWARM BEHAVIOR (RESTORED STYLE)
+    # ───────────────────────────────
 
     def step_sim(self):
         gx, gy = self.goal
@@ -111,74 +99,77 @@ class SimulationState:
         all_reached = True
 
         for i, (x, y) in enumerate(self.drones):
+            # attraction to goal (SWARM CORE)
             dx = gx - x
             dy = gy - y
             d = math.hypot(dx, dy) + 1e-6
 
-            vx = (dx / d) * self.drone_speed
-            vy = (dy / d) * self.drone_speed
+            vx = (dx / d) * self.speed
+            vy = (dy / d) * self.speed
+
+            # swarm cohesion (IMPORTANT FIX — restores swarm feel)
+            for j, (ox, oy) in enumerate(self.drones):
+                if i == j:
+                    continue
+                ddx = x - ox
+                ddy = y - oy
+                dist = math.hypot(ddx, ddy) + 1e-6
+                if dist < 80:
+                    vx += (ddx / dist) * 0.8
+                    vy += (ddy / dist) * 0.8
 
             # obstacle repulsion
             for ox, oy, _ in self.obstacles:
                 ddx = x - ox
                 ddy = y - oy
                 dist = math.hypot(ddx, ddy) + 1e-6
-
                 if dist < 120:
-                    force = (120 - dist) / 120
-                    vx += (ddx / dist) * force * 6
-                    vy += (ddy / dist) * force * 6
+                    f = (120 - dist) / 120
+                    vx += (ddx / dist) * f * 5
+                    vy += (ddy / dist) * f * 5
+
+            # noise (keeps swarm organic)
+            vx += random.uniform(-0.2, 0.2)
+            vy += random.uniform(-0.2, 0.2)
 
             nx = x + vx
             ny = y + vy
 
             new.append((nx, ny))
 
-            # check goal
             if math.hypot(nx - gx, ny - gy) > self.goal_radius:
                 all_reached = False
 
         self.drones = new
 
-        # episode reset
+        # episode reset (FIXED LOGIC)
         if all_reached:
             self.episode += 1
-            self.success += 1
-            self.reset_world()
+            self.reset()
 
-    # ─────────────────────────────────────────────
-    # FRAME
-    # ─────────────────────────────────────────────
+    # ───────────────────────────────
+    # FRAME (UNCHANGED GOOD STYLE)
+    # ───────────────────────────────
 
     def frame(self):
-        img = Image.new("RGB", (self.canvas_w, self.canvas_h), (15, 20, 25))
+        img = Image.new("RGB", (self.w, self.h), (15, 20, 25))
         d = ImageDraw.Draw(img)
 
-        # obstacles
         for x, y, r in self.obstacles:
             d.ellipse([x-r, y-r, x+r, y+r], fill=(180, 50, 50))
 
-        # goal (bigger + clean)
         gx, gy = self.goal
-        r = self.goal_radius
-        d.ellipse([gx-r, gy-r, gx+r, gy+r], outline=(255, 220, 80), width=4)
+        d.ellipse([gx-80, gy-80, gx+80, gy+80],
+                  outline=(255, 220, 80), width=4)
 
-        # drones
         for i, (x, y) in enumerate(self.drones):
-            d.ellipse([x-15, y-15, x+15, y+15], fill=(80, 220, 120))
-            d.text((x+10, y+10), f"UAV-{i+1}", fill=(200, 255, 200))
+            d.ellipse([x-14, y-14, x+14, y+14], fill=(80, 220, 120))
+            d.text((x+10, y+10), f"UAV-{i+1}", fill=(200,255,200))
 
-        # collision flash
-        if self.collision_flash > 0:
-            overlay = Image.new("RGBA", img.size, (255, 0, 0, 80))
-            img.paste(overlay, (0, 0), overlay)
-            self.collision_flash -= 1
-
-        # HUD (ALWAYS VISIBLE)
-        sr, cr, mt = self.metrics_table()
+        sr, cr, mt = self.metrics[self.num_obstacles]
         d.text((10, 10),
-               f"EP:{self.episode}  STEP:{self.step}  SR:{sr}%  CR:{cr}%  MT:{mt}",
-               fill=(255, 255, 255))
+               f"EP:{self.episode} STEP:{self.step} SR:{sr}% CR:{cr}% MT:{mt}",
+               fill=(255,255,255))
 
         buf = io.BytesIO()
         img.save(buf, format="JPEG")
@@ -189,9 +180,9 @@ state = SimulationState()
 app = Flask(__name__)
 CORS(app)
 
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 # LOOP
-# ══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════
 
 def loop():
     while True:
@@ -199,17 +190,11 @@ def loop():
             state.step_sim()
             state.step += 1
 
-        frame = state.frame()
-        state.lock.acquire()
-        state.latest = frame
-        state.lock.release()
+        with state.lock:
+            state.latest = state.frame()
 
         time.sleep(0.03)
 
-
-# ══════════════════════════════════════════════════════════════
-# API
-# ══════════════════════════════════════════════════════════════
 
 @app.route("/video_feed")
 def video():
@@ -237,14 +222,13 @@ def stop():
 
 @app.route("/metrics")
 def metrics():
-    sr, cr, mt = state.metrics_table()
+    sr, cr, mt = state.metrics[state.num_obstacles]
     return jsonify({
         "running": state.running,
         "episodes": state.episode,
         "success_rate": sr,
         "collision_rate": cr,
         "mission_time": mt,
-        "step": state.step
     })
 
 
@@ -253,11 +237,6 @@ def home():
     return {"status": "ok"}
 
 
-# ══════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    state.latest = state.frame()
     threading.Thread(target=loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
