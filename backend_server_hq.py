@@ -28,7 +28,25 @@ import torch
 import math
 
 from custom_aviary_standalone import CustomAviaryMADDPG
-from maddpg_networks import MADDPGAgent
+import torch.nn as nn
+
+# Actor network — reconstructed from checkpoint weight shapes:
+# Linear(13→256) → LayerNorm(256) → ReLU → Linear(256→256) → LayerNorm(256) → ReLU → Linear(256→4) → Tanh
+class ActorNet(nn.Module):
+    def __init__(self, obs_dim=13, act_dim=4, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, act_dim),
+            nn.Tanh(),
+        )
+    def forward(self, x):
+        return self.net(x)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -72,45 +90,33 @@ class BackendState:
         self.mission_time_avg = 0.0    # rolling average of steps per episode
     
     def load_checkpoint(self, checkpoint_path, num_agents=4):
-        """Load trained MADDPG checkpoints from a single .pt file.
-        
-        The checkpoint file contains keys: actor_0, actor_1, actor_2, actor_3
-        plus config, critic_N, target_actor_N, target_critic_N, etc.
-        """
+        """Load actor weights directly from checkpoint into ActorNet instances."""
         print(f"[BACKEND] Loading checkpoint: {checkpoint_path}")
-        
+
         if not os.path.exists(checkpoint_path):
             print(f"⚠️  Checkpoint not found: {checkpoint_path} — using random weights")
             checkpoint = {}
         else:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
-        config = checkpoint.get("config", {})
-        obs_dim = config.get("obs_dim", 13)
-        act_dim = config.get("act_dim", 4)
+
+        config     = checkpoint.get("config", {})
+        obs_dim    = config.get("obs_dim",    13)
+        act_dim    = config.get("act_dim",     4)
         hidden_dim = config.get("hidden_dim", 256)
-        
+
         self.agents = {}
         for i in range(num_agents):
-            agent = MADDPGAgent(
-                obs_dim=obs_dim,
-                act_dim=act_dim,
-                num_agents=num_agents,
-                hidden_dim=hidden_dim,
-                device=self.device
-            )
-            
-            key = f"actor_{i}"
+            actor = ActorNet(obs_dim=obs_dim, act_dim=act_dim, hidden_dim=hidden_dim)
+            key   = f"actor_{i}"
             if key in checkpoint:
-                agent.actor.load_state_dict(checkpoint[key])
+                actor.load_state_dict(checkpoint[key])
                 print(f"✅ Loaded {key} from checkpoint")
             else:
-                print(f"⚠️  Key '{key}' not in checkpoint — using random weights")
-            
-            agent.actor.eval()
-            self.agents[f"drone_{i}"] = agent
-        
-        print(f"[BACKEND] ✅ Loaded {num_agents} agents from {os.path.basename(checkpoint_path)}")
+                print(f"⚠️  Key '{key}' not found — using random weights")
+            actor.eval()
+            self.agents[f"drone_{i}"] = actor
+
+        print(f"[BACKEND] ✅ {num_agents} actors ready")
     
     def init_environment(self, num_drones=4, num_obstacles=4):
         """Initialize or reset the environment"""
@@ -137,25 +143,17 @@ class BackendState:
         return (canvas_x, canvas_y)
     
     def get_maddpg_actions(self, observations):
-        """Run MADDPG inference to get actions"""
+        """Run actor networks to get actions for all drones."""
         actions = {}
-        
         with torch.no_grad():
             for i in range(self.num_drones):
-                drone_key = f"drone_{i}"
-                
-                if drone_key not in observations:
+                key    = f"drone_{i}"
+                actor  = self.agents.get(key)
+                if actor is None or key not in observations:
                     continue
-                
-                obs_np = observations[drone_key]  # 13D observation
-                obs_tensor = torch.FloatTensor(obs_np).unsqueeze(0).to(self.device)
-                
-                # Actor network inference
-                action_tensor = self.agents[drone_key].actor(obs_tensor)
-                action_np = action_tensor.squeeze(0).cpu().numpy()
-                
-                actions[drone_key] = action_np
-        
+                obs_t  = torch.FloatTensor(observations[key]).unsqueeze(0)
+                act_t  = actor(obs_t)
+                actions[key] = act_t.squeeze(0).numpy()
         return actions
 
 
