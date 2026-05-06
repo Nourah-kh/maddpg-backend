@@ -384,7 +384,7 @@ def config():
 @app.route("/start", methods=["POST"])
 def start():
     """Start or resume the simulation"""
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}  # silent=True: never 415, just returns {}
     num_obstacles = data.get("num_obstacles", state.num_obstacles)
 
     checkpoint_map = {
@@ -471,7 +471,7 @@ def reset_stats():
 @app.route("/set_obstacles", methods=["POST"])
 def set_obstacles():
     """Switch obstacle config — pauses sim, swaps obstacles in existing PyBullet session, resumes"""
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     num_obstacles = data.get("num_obstacles", 4)
 
     checkpoint_map = {
