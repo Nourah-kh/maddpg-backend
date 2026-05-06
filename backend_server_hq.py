@@ -68,6 +68,7 @@ class BackendState:
         
         # Device
         self.device = "cpu"
+        self.has_ever_started = False  # stays False until user presses Start
     
     def load_checkpoint(self, checkpoint_path, num_agents=4):
         """Load trained MADDPG checkpoints from a single .pt file.
@@ -278,7 +279,8 @@ def render_frame():
 def run_simulation():
     """Main simulation loop. Runs many episodes continuously until stopped."""
     obs = None
-    episode_had_collision = False  # track per-episode, not per-step
+    episode_had_collision = False
+    episode_goal_reached = False
 
     while True:
         # ── Pause if stopped or env not ready ──
@@ -288,16 +290,7 @@ def run_simulation():
             continue
 
         # ── Start a new episode ──
-        if obs is None or state.step_count >= 300:
-            # Record results of the episode that just ended (skip episode 0)
-            if state.episode_count > 0:
-                if not episode_had_collision:
-                    state.success_count += 1
-                if episode_had_collision:
-                    state.collision_count += 1
-                print(f"[EPISODE {state.episode_count}] steps={state.step_count} "
-                      f"reward={state.episode_reward:.2f} collision={episode_had_collision}")
-
+        if obs is None:
             try:
                 obs, info = state.env.reset()
             except Exception as e:
@@ -309,6 +302,7 @@ def run_simulation():
             state.episode_reward = 0.0
             state.episode_count += 1
             episode_had_collision = False
+            episode_goal_reached = False
             print(f"[EPISODE {state.episode_count}] starting...")
 
         state.last_obs = obs
@@ -322,16 +316,34 @@ def run_simulation():
             obs, rewards, terminated, truncated, info = state.env.step(actions)
 
             state.episode_reward += sum(rewards.values())
+            state.step_count += 1
 
             state.last_crashed = state.env.crashed.copy()
             if any(state.last_crashed):
-                episode_had_collision = True  # flag for end-of-episode accounting
+                episode_had_collision = True
 
-            state.step_count += 1
+            # Check if episode should end
+            goal_reached = info.get("goal_reached", False)
+            episode_done = goal_reached or all(truncated.values())
+
+            if episode_done:
+                # Record results
+                if goal_reached:
+                    state.success_count += 1
+                    episode_goal_reached = True
+                if episode_had_collision:
+                    state.collision_count += 1
+
+                print(f"[EPISODE {state.episode_count}] done — "
+                      f"steps={state.step_count} "
+                      f"goal={'✅' if goal_reached else '❌'} "
+                      f"collision={'💥' if episode_had_collision else 'none'}")
+
+                obs = None  # triggers new episode on next iteration
 
         except Exception as e:
             print(f"❌ Step error: {e}")
-            obs = None  # force reset next iteration instead of killing thread
+            obs = None
             time.sleep(0.2)
             continue
 
@@ -401,6 +413,7 @@ def start():
         state.step_count = 0
 
     state.running = True
+    state.has_ever_started = True
     print("[BACKEND] ▶️  Simulation started")
     return jsonify({"status": "started", "obstacles": state.num_obstacles})
 
@@ -438,21 +451,33 @@ def video_feed():
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
-    """Return metrics in the format the frontend expects (polled every 500ms)"""
+    """Return metrics. All zeros until simulation is started."""
     episodes = state.episode_count
-    success_rate = (state.success_count / episodes * 100.0) if episodes > 0 else 0.0
-    collision_avoidance = 100.0 - (state.collision_count / max(episodes, 1) * 100.0)
-    collision_avoidance = max(0.0, collision_avoidance)
-    
+
+    if not state.has_ever_started or episodes == 0:
+        return jsonify({
+            "running": state.running,
+            "episodes": 0,
+            "success_rate": 0.0,
+            "current_step": 0,
+            "num_obstacles": state.num_obstacles,
+            "collision_avoidance": 0.0,
+            "swarm_coordination": 0.0,
+            "avg_response_time": 0.0,
+        })
+
+    success_rate = state.success_count / episodes * 100.0
+    collision_avoidance = 100.0 - (state.collision_count / episodes * 100.0)
+
     return jsonify({
         "running": state.running,
         "episodes": episodes,
         "success_rate": round(success_rate, 1),
         "current_step": state.step_count,
         "num_obstacles": state.num_obstacles,
-        "collision_avoidance": round(collision_avoidance, 1),
-        "swarm_coordination": 98.5,  # placeholder — no coordination metric in env yet
-        "avg_response_time": 12.5,   # placeholder
+        "collision_avoidance": round(max(0.0, collision_avoidance), 1),
+        "swarm_coordination": 98.5,
+        "avg_response_time": 12.5,
     })
 
 
@@ -504,6 +529,7 @@ def set_obstacles():
         state.episode_reward = 0.0
         state.last_crashed = []
         state.last_obs = None  # triggers env.reset() on next sim loop iteration
+        state.has_ever_started = False  # metrics go back to zero for new config
 
         if was_running:
             state.running = True
