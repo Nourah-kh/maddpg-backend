@@ -69,30 +69,46 @@ class BackendState:
         # Device
         self.device = "cpu"
     
-    def load_checkpoint(self, checkpoint_dir, num_agents=4):
-        """Load trained MADDPG checkpoints"""
-        print(f"[BACKEND] Loading checkpoints from {checkpoint_dir}")
+    def load_checkpoint(self, checkpoint_path, num_agents=4):
+        """Load trained MADDPG checkpoints from a single .pt file.
+        
+        The checkpoint file contains keys: actor_0, actor_1, actor_2, actor_3
+        plus config, critic_N, target_actor_N, target_critic_N, etc.
+        """
+        print(f"[BACKEND] Loading checkpoint: {checkpoint_path}")
+        
+        if not os.path.exists(checkpoint_path):
+            print(f"⚠️  Checkpoint not found: {checkpoint_path} — using random weights")
+            checkpoint = {}
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        config = checkpoint.get("config", {})
+        obs_dim = config.get("obs_dim", 13)
+        act_dim = config.get("act_dim", 4)
+        hidden_dim = config.get("hidden_dim", 256)
         
         self.agents = {}
         for i in range(num_agents):
             agent = MADDPGAgent(
-                obs_dim=13,
-                act_dim=4,
+                obs_dim=obs_dim,
+                act_dim=act_dim,
                 num_agents=num_agents,
-                hidden_dim=256,
+                hidden_dim=hidden_dim,
                 device=self.device
             )
             
-            # Load actor checkpoint
-            actor_path = os.path.join(checkpoint_dir, f"actor_{i}.pt")
-            if os.path.exists(actor_path):
-                agent.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
-                print(f"✅ Loaded actor_{i}.pt")
+            key = f"actor_{i}"
+            if key in checkpoint:
+                agent.actor.load_state_dict(checkpoint[key])
+                print(f"✅ Loaded {key} from checkpoint")
             else:
-                print(f"⚠️  No checkpoint found at {actor_path}, using random initialization")
+                print(f"⚠️  Key '{key}' not in checkpoint — using random weights")
             
-            agent.actor.eval()  # Set to evaluation mode
+            agent.actor.eval()
             self.agents[f"drone_{i}"] = agent
+        
+        print(f"[BACKEND] ✅ Loaded {num_agents} agents from {os.path.basename(checkpoint_path)}")
     
     def init_environment(self, num_drones=4, num_obstacles=4):
         """Initialize or reset the environment"""
@@ -342,12 +358,18 @@ def config():
 @app.route("/start", methods=["POST"])
 def start():
     data = request.json or {}
-    checkpoint_dir = data.get("checkpoint_dir", "checkpoints")
     num_drones = data.get("num_drones", 4)
-    num_obstacles = data.get("num_obstacles", 4)
+    num_obstacles = data.get("num_obstacles", state.num_obstacles)
+    
+    checkpoint_map = {
+        2: "checkpoints/maddpg_final-Ep17.pt",
+        3: "checkpoints/maddpg_final-Ep17-o3-v2.pt",
+        4: "checkpoints/maddpg_final-Ep17-o4-.pt",
+    }
+    checkpoint_path = data.get("checkpoint_path", checkpoint_map.get(num_obstacles, checkpoint_map[4]))
     
     state.init_environment(num_drones, num_obstacles)
-    state.load_checkpoint(checkpoint_dir, num_drones)
+    state.load_checkpoint(checkpoint_path, num_drones)
     
     state.running = True
     state.episode_count = 0
@@ -391,8 +413,73 @@ def video_feed():
     )
 
 
-@app.route("/stats", methods=["GET"])
-def stats():
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Return metrics in the format the frontend expects (polled every 500ms)"""
+    episodes = state.episode_count
+    success_rate = (state.success_count / episodes * 100.0) if episodes > 0 else 0.0
+    collision_avoidance = 100.0 - (state.collision_count / max(episodes, 1) * 100.0)
+    collision_avoidance = max(0.0, collision_avoidance)
+    
+    return jsonify({
+        "running": state.running,
+        "episodes": episodes,
+        "success_rate": round(success_rate, 1),
+        "current_step": state.step_count,
+        "num_obstacles": state.num_obstacles,
+        "collision_avoidance": round(collision_avoidance, 1),
+        "swarm_coordination": 98.5,  # placeholder — no coordination metric in env yet
+        "avg_response_time": 12.5,   # placeholder
+    })
+
+
+@app.route("/reset_stats", methods=["POST"])
+def reset_stats():
+    """Reset episode statistics"""
+    state.episode_count = 0
+    state.success_count = 0
+    state.collision_count = 0
+    state.step_count = 0
+    state.episode_reward = 0.0
+    return jsonify({"status": "reset"})
+
+
+@app.route("/set_obstacles", methods=["POST"])
+def set_obstacles():
+    """Switch obstacle configuration and reload matching checkpoint"""
+    data = request.get_json() or {}
+    num_obstacles = data.get("num_obstacles", 4)
+    
+    checkpoint_map = {
+        2: "checkpoints/maddpg_final-Ep17.pt",
+        3: "checkpoints/maddpg_final-Ep17-o3-v2.pt",
+        4: "checkpoints/maddpg_final-Ep17-o4-.pt",
+    }
+    
+    if num_obstacles not in checkpoint_map:
+        return jsonify({"status": "error", "message": f"Invalid num_obstacles: {num_obstacles}"}), 400
+    
+    was_running = state.running
+    state.running = False
+    time.sleep(0.15)  # let sim thread pause
+    
+    try:
+        state.init_environment(num_drones=4, num_obstacles=num_obstacles)
+        state.load_checkpoint(checkpoint_map[num_obstacles], num_agents=4)
+        state.episode_count = 0
+        state.success_count = 0
+        state.collision_count = 0
+        state.step_count = 0
+        state.episode_reward = 0.0
+        state.running = was_running
+        return jsonify({"status": "success", "num_obstacles": num_obstacles})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
     return jsonify({
         "episode": state.episode_count,
         "step": state.step_count,
@@ -408,6 +495,16 @@ def stats():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # Auto-start on Railway: init env + load checkpoint before Flask starts
+    print("[BOOT] Auto-initializing environment and loading checkpoint...")
+    try:
+        state.init_environment(num_drones=4, num_obstacles=4)
+        state.load_checkpoint("checkpoints/maddpg_final-Ep17-o4-.pt", num_agents=4)
+        state.running = True
+        print("[BOOT] ✅ Environment ready, simulation will start with Flask")
+    except Exception as e:
+        print(f"[BOOT] ⚠️  Auto-start failed: {e} — use POST /start to initialize manually")
+
     sim_thread = threading.Thread(target=run_simulation, daemon=True)
     sim_thread.start()
     
