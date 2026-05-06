@@ -98,25 +98,24 @@ class CustomAviaryMADDPG:
         self._loadDrones()
         self._addObstacles()
 
-        # Safe goal candidates — shuffled each episode
-        candidates = [
-            np.array([ 0.0,  2.5, 1.0], dtype=np.float32),
-            np.array([ 0.0, -2.5, 1.0], dtype=np.float32),
-            np.array([ 2.0,  2.0, 1.0], dtype=np.float32),
-            np.array([-2.0,  2.0, 1.0], dtype=np.float32),
-            np.array([-2.0, -2.0, 1.0], dtype=np.float32),
-            np.array([ 2.0, -2.0, 1.0], dtype=np.float32),
-        ]
+        # Goal placement: must be at least 3.5m from origin so no drone
+        # starts within the 3m success radius. Eliminates trivial step-0 successes.
         obs_positions = []
         for obs_id in self.obstacle_ids:
             op, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
-            obs_positions.append(np.array(op))
+            obs_positions.append(np.array(op[:2]))
 
-        np.random.shuffle(candidates)
-        self.goal_pos = candidates[0]
-        for c in candidates:
-            if all(np.linalg.norm(c[:2] - op[:2]) >= 1.2 for op in obs_positions):
-                self.goal_pos = c
+        self.goal_pos = np.array([4.0, 0.0, 1.0], dtype=np.float32)  # fallback
+        for _ in range(50):  # try up to 50 random placements
+            angle = np.random.uniform(0, 2 * np.pi)
+            r     = np.random.uniform(3.5, 4.5)   # far from drones, inside arena
+            gx, gy = r * np.cos(angle), r * np.sin(angle)
+            # Keep inside arena bound (-5 to 5)
+            if abs(gx) > 4.8 or abs(gy) > 4.8:
+                continue
+            # Must be at least 1.2m from any obstacle
+            if all(np.linalg.norm(np.array([gx, gy]) - op) >= 1.2 for op in obs_positions):
+                self.goal_pos = np.array([gx, gy, 1.0], dtype=np.float32)
                 break
 
         goal_vis = p.createVisualShape(
