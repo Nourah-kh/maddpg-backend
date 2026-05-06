@@ -30,11 +30,13 @@ class CustomAviaryMADDPG:
     MAX_BOUND_XY = 5.0
     MAX_HEIGHT   = 3.0
     MIN_HEIGHT   = 0.2
-    GOAL_RADIUS  = 3.0
+    GOAL_RADIUS  = 1.5    # reduced — requires actual navigation, looks fair on screen
     MAX_STEPS    = 300
     PROX_RANGE   = 5.0
     ACTION_SMOOTHING = 0.5
     MAX_ACCEL    = 2.0
+    DRONE_RADIUS = 0.15   # for distance-based crash detection
+    OBS_RADIUS   = 0.55   # effective obstacle radius (cube ~0.4 half-width + drone radius)
 
     def __init__(self, num_drones=4, num_obstacles=4, gui=False, **kwargs):
         self.num_drones    = num_drones
@@ -98,20 +100,19 @@ class CustomAviaryMADDPG:
         self._loadDrones()
         self._addObstacles()
 
-        # Goal placement: must be at least 3.5m from origin so no drone
-        # starts within the 3m success radius. Eliminates trivial step-0 successes.
+        # Goal placement: must be at least 2.5m from origin so no drone
+        # starts within the 1.5m success radius. Eliminates trivial step-0 successes.
         obs_positions = []
         for obs_id in self.obstacle_ids:
             op, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
             obs_positions.append(np.array(op[:2]))
 
         self.goal_pos = np.array([4.0, 0.0, 1.0], dtype=np.float32)  # fallback
-        for _ in range(50):  # try up to 50 random placements
+        for _ in range(50):
             angle = np.random.uniform(0, 2 * np.pi)
-            r     = np.random.uniform(3.5, 4.5)   # far from drones, inside arena
+            r     = np.random.uniform(2.5, 4.5)
             gx, gy = r * np.cos(angle), r * np.sin(angle)
-            # Keep inside arena bound (-5 to 5)
-            if abs(gx) > 4.8 or abs(gy) > 4.8:
+            if abs(gx) > 4.5 or abs(gy) > 4.5:
                 continue
             # Must be at least 1.2m from any obstacle
             if all(np.linalg.norm(np.array([gx, gy]) - op) >= 1.2 for op in obs_positions):
@@ -232,15 +233,34 @@ class CustomAviaryMADDPG:
         return min_d if min_d < float("inf") else 0.0
 
     def _check_crashes(self):
+        """Distance-based collision detection — more reliable than getContactPoints
+        which misses fast-moving objects between substeps."""
         for i in range(self.num_drones):
             if self.crashed[i]:
+                # Freeze crashed drone in place
+                p.resetBaseVelocity(
+                    self.DRONE_IDS[i],
+                    linearVelocity=[0, 0, 0],
+                    angularVelocity=[0, 0, 0],
+                    physicsClientId=self.client
+                )
                 continue
+
+            pos_i, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.client)
+            pos_i = np.array(pos_i)
+
+            # Drone-drone collision
             for j in range(i + 1, self.num_drones):
-                if p.getContactPoints(self.DRONE_IDS[i], self.DRONE_IDS[j], physicsClientId=self.client):
+                pos_j, _ = p.getBasePositionAndOrientation(self.DRONE_IDS[j], physicsClientId=self.client)
+                if np.linalg.norm(pos_i - np.array(pos_j)) < self.DRONE_RADIUS * 2:
                     self.crashed[i] = self.crashed[j] = True
                     self.crash_type[i] = self.crash_type[j] = "drone_collision"
+
+            # Obstacle collision — distance from drone centre to obstacle centre
             for obs_id in self.obstacle_ids:
-                if p.getContactPoints(self.DRONE_IDS[i], obs_id, physicsClientId=self.client):
+                obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=self.client)
+                dist = np.linalg.norm(pos_i[:2] - np.array(obs_pos[:2]))  # 2D distance
+                if dist < self.OBS_RADIUS:
                     self.crashed[i]    = True
                     self.crash_type[i] = "obstacle_collision"
 
