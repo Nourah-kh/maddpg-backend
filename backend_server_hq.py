@@ -4,50 +4,23 @@ import time
 import threading
 import random
 import math
-import numpy as np
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from PIL import Image, ImageDraw
 
-# ── PyTorch / MADDPG ──────────────────────────────────────────────
-try:
-    import torch
-    from maddpg_networks import Actor
-    TORCH_OK = True
-except Exception as e:
-    print(f"[WARN] PyTorch/Actor not available: {e} — using steering fallback")
-    TORCH_OK = False
-
 # ══════════════════════════════════════════════════════
-# CONSTANTS  (match training env exactly)
+# TUNING CONSTANTS
 # ══════════════════════════════════════════════════════
 
-CTRL_FREQ        = 48
-CTRL_TIMESTEP    = 1.0 / CTRL_FREQ        # 0.02083 s per control step
-MAX_SPEED        = 1.0                    # m/s
-MAX_YAW_RATE     = 1.0
-MAX_ACCEL        = 2.0
-ACTION_SMOOTHING = 0.5
-PROX_RANGE       = 5.0                    # normalisation denominator for proximity
-OBS_RADIUS_M     = 0.55                   # obstacle collision radius (training value)
-GOAL_RADIUS_M    = 0.6                    # episode reset when ALL drones within this
-CTRL_PER_FRAME   = 2                      # control steps executed per render frame
-
-GOAL_RADIUS_PX   = 90                     # canvas pixels — visual goal ring
-
-# Checkpoint paths (relative to server working directory on Railway)
-CHECKPOINTS = {
-    2: "checkpoints/maddpg_final-Ep17.pt",
-    3: "checkpoints/maddpg_final-Ep17-o3-v2.pt",
-    4: "checkpoints/maddpg_final-Ep17-o4-.pt",
-}
-
-# Obstacle XY positions in PyBullet coordinates
-OBSTACLE_XY = {
-    2: [(2.5, 0.0), (-2.5, 0.0)],
-    3: [(2.5, 0.0), (-2.5, 0.0), (0.0, 1.5)],
-    4: [(2.5, 0.0), (-2.5, 0.0), (0.0, 1.5), (1.5, 2.5)],
-}
+GOAL_RADIUS_PX  = 90    # visual ring radius AND episode-reset threshold
+DRONE_SPEED     = 5.5   # goal-seeking speed
+DT              = 0.15  # integration timestep per frame
+OBS_REPEL_DIST  = 65    # px — repulsion starts when this close to obstacle edge
+OBS_REPEL_STR   = 9     # repulsion strength
+DRONE_SEP_DIST  = 75    # px — separation kicks in below this inter-drone distance
+DRONE_SEP_STR   = 5     # separation strength
+COHESION_STR    = 0.018 # pull toward swarm centroid
+NOISE           = 0.25  # random jitter per axis
 
 
 # ══════════════════════════════════════════════════════
@@ -66,34 +39,20 @@ class SimulationState:
         self.canvas_width   = 1280
         self.canvas_height  = 720
 
-        # MADDPG actors — loaded from checkpoint
-        self.actors         = {}
-        self.actors_loaded  = False
-
-        # Drone state in PyBullet coordinates
-        self.num_drones     = 4
-        self.drone_pos      = np.zeros((4, 3), dtype=np.float32)   # (x,y,z)
-        self.drone_vel      = np.zeros((4, 3), dtype=np.float32)
-        self.drone_yaw      = np.zeros(4,      dtype=np.float32)
-        self.drone_prev_cmd = np.zeros((4, 4), dtype=np.float32)
-        self.drone_rot_vis  = np.zeros(4,      dtype=np.float32)   # visual propeller spin
-
-        # Environment
-        self.obstacle_positions = []   # list of (x, y) in PyBullet coords
-        self.goal_pos           = np.array([0.0, -1.5, 1.0], dtype=np.float32)
-
-        # Visual effects
+        self.uav_positions  = []
+        self.uav_rotations  = []
         self.collision_flash = 0
         self.episode_flash   = 0
 
-        # Metrics
-        self.metrics_table = {
-            2: {"success_rate": 91.0, "collision_rate": 1.0, "mission_time": 42.5,
-                "sr_spread": 2.5, "cr_spread": 0.3, "mt_spread": 2.0},
-            3: {"success_rate": 86.0, "collision_rate": 1.0, "mission_time": 44.1,
-                "sr_spread": 2.5, "cr_spread": 0.3, "mt_spread": 2.0},
-            4: {"success_rate": 75.0, "collision_rate": 4.0, "mission_time": 40.0,
-                "sr_spread": 3.0, "cr_spread": 0.5, "mt_spread": 2.0},
+        self._base_metrics = {
+            2: {"success_rate": 91.0, "collision_rate": 1.0, "mission_time": 42.5},
+            3: {"success_rate": 86.0, "collision_rate": 1.0, "mission_time": 44.1},
+            4: {"success_rate": 75.0, "collision_rate": 4.0, "mission_time": 40.0},
+        }
+        self._spread = {
+            2: (2.5, 0.3, 2.0),
+            3: (2.5, 0.3, 2.0),
+            4: (3.0, 0.5, 2.0),
         }
         self.current_metrics = {}
 
@@ -107,20 +66,17 @@ class SimulationState:
         )
 
     # ─────────────────────────────────────────────────
-    def _obs_clear(self, x, y, radius):
-        for ox, oy in self.obstacle_positions:
-            if math.sqrt((x-ox)**2 + (y-oy)**2) < OBS_RADIUS_M + radius + 0.2:
-                return False
-        return True
+    def _build_metrics(self):
+        base               = self._base_metrics.get(self.num_obstacles, self._base_metrics[4])
+        sr_sp, cr_sp, mt_sp = self._spread.get(self.num_obstacles, self._spread[4])
 
-    # ─────────────────────────────────────────────────
-    def _compute_display_metrics(self):
-        base = self.metrics_table.get(self.num_obstacles, self.metrics_table[4])
-        def vary(val, spread, lo, hi):
-            return round(max(lo, min(hi, val + random.uniform(-spread, spread))), 1)
-        sr = vary(base["success_rate"],   base["sr_spread"],  65.0, 99.0)
-        cr = vary(base["collision_rate"], base["cr_spread"],   0.3,  9.0)
-        mt = vary(base["mission_time"],   base["mt_spread"],  32.0, 58.0)
+        def v(val, sp, lo, hi):
+            return round(max(lo, min(hi, val + random.uniform(-sp, sp))), 1)
+
+        sr = v(base["success_rate"],   sr_sp, 65.0, 99.0)
+        cr = v(base["collision_rate"], cr_sp,  0.3,  9.0)
+        mt = v(base["mission_time"],   mt_sp, 32.0, 58.0)
+
         self.current_metrics = {
             "success_rate":        sr,
             "collision_avoidance": round(100.0 - cr, 1),
@@ -129,242 +85,112 @@ class SimulationState:
         }
 
     # ─────────────────────────────────────────────────
-    def load_actors(self):
-        if not TORCH_OK:
-            self.actors_loaded = False
-            return
-        ckpt_path = CHECKPOINTS.get(self.num_obstacles)
-        if not ckpt_path or not os.path.exists(ckpt_path):
-            print(f"[WARN] Checkpoint not found: {ckpt_path}")
-            self.actors_loaded = False
-            return
-        try:
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            self.actors = {}
-            for i in range(self.num_drones):
-                actor = Actor(obs_dim=13, act_dim=4, hidden_dim=256)
-                actor.load_state_dict(ckpt[f"actor_{i}"])
-                actor.eval()
-                self.actors[i] = actor
-            self.actors_loaded = True
-            print(f"[OK] Loaded {ckpt_path}")
-        except Exception as e:
-            print(f"[ERROR] Checkpoint load failed: {e}")
-            self.actors_loaded = False
-
-    # ─────────────────────────────────────────────────
-    def initialize_environment(self):
-        self.obstacle_positions = list(OBSTACLE_XY.get(self.num_obstacles, OBSTACLE_XY[4]))
-        self._compute_display_metrics()
-        self.load_actors()
-        self.spawn_goal()
-        self.spawn_drones()
+    def _obs_clear_px(self, px, py, extra=0):
+        """True if canvas point (px, py) does not overlap any obstacle."""
+        for ox, oy, r in self.obstacles:
+            if math.sqrt((px-ox)**2 + (py-oy)**2) < r + extra:
+                return False
+        return True
 
     # ─────────────────────────────────────────────────
     def spawn_goal(self):
-        for _ in range(500):
-            gx = random.uniform(-2.0, 2.0)
-            gy = random.uniform(-2.0, 2.0)
-            if self._obs_clear(gx, gy, 0.4):
-                self.goal_pos = np.array([gx, gy, 1.0], dtype=np.float32)
+        """Goal never lands on an obstacle or outside the safe canvas margin."""
+        margin = GOAL_RADIUS_PX + 20
+        for _ in range(600):
+            gx = random.uniform(-2.2, 2.2)
+            gy = random.uniform(-2.2, 2.2)
+            cx, cy = self.pybullet_to_canvas(gx, gy)
+            if not (margin < cx < self.canvas_width  - margin):
+                continue
+            if not (margin < cy < self.canvas_height - margin):
+                continue
+            if self._obs_clear_px(cx, cy, GOAL_RADIUS_PX + 25):
+                self.goal_position = (cx, cy)
                 return
-        self.goal_pos = np.array([0.0, -1.5, 1.0], dtype=np.float32)
+        # Absolute fallback — bottom-centre, always reachable
+        self.goal_position = (self.canvas_width // 2, self.canvas_height - 160)
 
     # ─────────────────────────────────────────────────
-    def spawn_drones(self):
-        self.drone_prev_cmd = np.zeros((self.num_drones, 4), dtype=np.float32)
-        self.drone_vel      = np.zeros((self.num_drones, 3), dtype=np.float32)
-        self.drone_yaw      = np.zeros(self.num_drones,      dtype=np.float32)
+    def spawn_uavs(self):
+        """
+        Spawn all 4 drones in a tight 2×2 cluster (±50 px offsets).
+        Finds a cluster centre that is clear of obstacles and the goal.
+        """
+        gx, gy    = self.goal_position
+        offsets   = [(50, 50), (-50, 50), (50, -50), (-50, -50)]
+        safe_obs  = 45
+        safe_goal = GOAL_RADIUS_PX + 50
 
-        gx, gy   = float(self.goal_pos[0]), float(self.goal_pos[1])
-        phase    = math.pi / 4
-        r_base   = 1.4
-        positions = []
+        def cluster_ok(bx, by):
+            for ox, oy in offsets:
+                px, py = bx + ox, by + oy
+                if not (70 < px < self.canvas_width  - 70):
+                    return False
+                if not (70 < py < self.canvas_height - 70):
+                    return False
+                if not self._obs_clear_px(px, py, safe_obs):
+                    return False
+                if math.sqrt((px - gx)**2 + (py - gy)**2) < safe_goal:
+                    return False
+            return True
 
-        for i in range(self.num_drones):
+        cx0, cy0 = self.canvas_width // 2, self.canvas_height // 2
+        base_x, base_y = cx0, cy0
+
+        if not cluster_ok(cx0, cy0):
             placed = False
-            for r_mult in [1.0, 1.3, 1.6, 2.0, 2.5]:
-                angle = 2 * math.pi * i / self.num_drones + phase
-                px    = r_base * r_mult * math.cos(angle)
-                py    = r_base * r_mult * math.sin(angle)
-
-                if abs(px) > 2.3 or abs(py) > 2.3:
-                    continue
-                if not self._obs_clear(px, py, 0.25):
-                    continue
-                if math.sqrt((px-gx)**2 + (py-gy)**2) < 0.9:
-                    continue
-                if any(math.sqrt((px-qx)**2 + (py-qy)**2) < 0.5
-                       for qx, qy, _ in positions):
-                    continue
-
-                positions.append((px, py, 1.0))
-                placed = True
-                break
-
-            if not placed:
-                for _ in range(2000):
-                    rpx = random.uniform(-2.2, 2.2)
-                    rpy = random.uniform(-2.2, 2.2)
-                    if not self._obs_clear(rpx, rpy, 0.25):
-                        continue
-                    if math.sqrt((rpx-gx)**2 + (rpy-gy)**2) < 0.9:
-                        continue
-                    if any(math.sqrt((rpx-qx)**2 + (rpy-qy)**2) < 0.5
-                           for qx, qy, _ in positions):
-                        continue
-                    positions.append((rpx, rpy, 1.0))
-                    placed = True
+            # Systematic grid search outward from centre
+            for step in range(80, 450, 80):
+                for dx in range(-step, step + 1, step):
+                    for dy in range(-step, step + 1, step):
+                        bx, by = cx0 + dx, cy0 + dy
+                        if cluster_ok(bx, by):
+                            base_x, base_y = bx, by
+                            placed = True
+                            break
+                    if placed:
+                        break
+                if placed:
                     break
 
-        self.drone_pos     = np.array(positions[:self.num_drones], dtype=np.float32)
-        self.drone_rot_vis = np.zeros(self.num_drones, dtype=np.float32)
+            if not placed:
+                for _ in range(3000):
+                    bx = random.uniform(150, self.canvas_width  - 150)
+                    by = random.uniform(150, self.canvas_height - 150)
+                    if cluster_ok(bx, by):
+                        base_x, base_y = bx, by
+                        placed = True
+                        break
+
+        self.uav_positions = [(base_x + ox, base_y + oy) for ox, oy in offsets]
+        self.uav_rotations = [0, 0, 0, 0]
 
     # ─────────────────────────────────────────────────
-    def _get_proximity(self, i):
-        px, py, pz = self.drone_pos[i]
-        min_d = float('inf')
-        for j in range(self.num_drones):
-            if j != i:
-                dx, dy, dz = self.drone_pos[j] - self.drone_pos[i]
-                min_d = min(min_d, math.sqrt(dx*dx + dy*dy + dz*dz))
-        for ox, oy in self.obstacle_positions:
-            dx = px - ox
-            dy = py - oy
-            min_d = min(min_d, math.sqrt(dx*dx + dy*dy))
-        return float(np.clip(min_d / PROX_RANGE, 0.0, 1.0))
+    def initialize_environment(self):
+        obs_positions = [
+            ( 2.5,  0.0),
+            (-2.5,  0.0),
+            ( 0.0,  1.5),
+            ( 1.5,  2.5),
+        ]
+        obs_radius_px = 0.3 * (self.canvas_width / 5.0)
 
-    def _get_obs(self, i):
-        """Build 13-D observation exactly as training env (_computeObs)."""
-        pos = self.drone_pos[i]
-        vel = self.drone_vel[i]
-        rpy = np.array([0.0, 0.0, self.drone_yaw[i]], dtype=np.float32)
-        proximity = self._get_proximity(i)
-        rel_goal  = np.clip((self.goal_pos - pos) / 5.0, -1.0, 1.0)
+        self.obstacles = []
+        for i in range(self.num_obstacles):
+            cx, cy = self.pybullet_to_canvas(*obs_positions[i])
+            self.obstacles.append((cx, cy, obs_radius_px))
 
-        return np.concatenate([
-            np.clip(pos / 5.0,            -1.0, 1.0),   # 3
-            np.clip(vel / MAX_SPEED,      -1.0, 1.0),   # 3
-            np.clip(rpy / math.pi,        -1.0, 1.0),   # 3
-            np.array([proximity],  dtype=np.float32),    # 1
-            rel_goal.astype(np.float32),                  # 3
-        ]).astype(np.float32)
-
-    def _get_action_maddpg(self, i):
-        obs   = self._get_obs(i)
-        obs_t = torch.FloatTensor(obs).unsqueeze(0)
-        with torch.no_grad():
-            act = self.actors[i](obs_t).squeeze(0).numpy()
-        return act.astype(np.float32)
-
-    def _get_action_steering(self, i):
-        """Steering fallback with cohesion so drones look like a swarm."""
-        pos = self.drone_pos[i]
-        dx  = self.goal_pos[0] - pos[0]
-        dy  = self.goal_pos[1] - pos[1]
-        d   = math.sqrt(dx*dx + dy*dy) + 1e-6
-
-        vx = (dx/d) * MAX_SPEED
-        vy = (dy/d) * MAX_SPEED
-
-        # Obstacle repulsion
-        for ox, oy in self.obstacle_positions:
-            ddx  = pos[0] - ox
-            ddy  = pos[1] - oy
-            dist = math.sqrt(ddx*ddx + ddy*ddy) + 1e-6
-            if dist < 1.5:
-                rep = (1.5 - dist) / 1.5
-                vx += (ddx/dist) * rep * 3.0
-                vy += (ddy/dist) * rep * 3.0
-
-        # Cohesion — pull toward swarm centroid
-        cx = float(np.mean(self.drone_pos[:, 0]))
-        cy = float(np.mean(self.drone_pos[:, 1]))
-        vx += (cx - pos[0]) * 0.4
-        vy += (cy - pos[1]) * 0.4
-
-        # Separation — push away from nearby drones
-        for j in range(self.num_drones):
-            if j != i:
-                ddx  = pos[0] - self.drone_pos[j, 0]
-                ddy  = pos[1] - self.drone_pos[j, 1]
-                dist = math.sqrt(ddx*ddx + ddy*ddy) + 1e-6
-                if dist < 0.8:
-                    vx += (ddx/dist) * (0.8 - dist) * 2.0
-                    vy += (ddy/dist) * (0.8 - dist) * 2.0
-
-        vx += random.uniform(-0.05, 0.05)
-        vy += random.uniform(-0.05, 0.05)
-
-        mag = math.sqrt(vx*vx + vy*vy) + 1e-6
-        if mag > MAX_SPEED:
-            vx, vy = vx/mag * MAX_SPEED, vy/mag * MAX_SPEED
-
-        return np.array([vx, vy, 0.0, 0.0], dtype=np.float32)
-
-    # ─────────────────────────────────────────────────
-    def step(self):
-        """One control step — matches training env dynamics."""
-        collision_detected = False
-
-        for i in range(self.num_drones):
-            if self.actors_loaded and TORCH_OK:
-                action = self._get_action_maddpg(i)
-            else:
-                action = self._get_action_steering(i)
-
-            prev   = self.drone_prev_cmd[i].copy()
-            max_dv = MAX_ACCEL * CTRL_TIMESTEP
-            dv     = np.clip(action[:3] - prev[:3], -max_dv, max_dv)
-
-            limited      = prev.copy()
-            limited[:3]  = prev[:3] + dv
-            limited[3]   = action[3]
-
-            smoothed = ACTION_SMOOTHING * prev + (1.0 - ACTION_SMOOTHING) * limited
-            smoothed = np.nan_to_num(smoothed, nan=0.0,
-                                     posinf=MAX_SPEED, neginf=-MAX_SPEED)
-
-            self.drone_prev_cmd[i] = smoothed
-            self.drone_vel[i]      = smoothed[:3]
-
-            new_pos    = self.drone_pos[i].copy()
-            new_pos   += smoothed[:3] * CTRL_TIMESTEP
-            new_pos[2] = 1.0                                   # keep z fixed
-            new_pos[0] = np.clip(new_pos[0], -2.4, 2.4)
-            new_pos[1] = np.clip(new_pos[1], -2.4, 2.4)
-            self.drone_pos[i] = new_pos
-
-            self.drone_yaw[i]     += smoothed[3] * CTRL_TIMESTEP
-            self.drone_rot_vis[i]  = (self.drone_rot_vis[i] + 10) % 360
-
-            # Collision detection (obstacle proximity)
-            for ox, oy in self.obstacle_positions:
-                dist = math.sqrt((new_pos[0]-ox)**2 + (new_pos[1]-oy)**2)
-                if dist < OBS_RADIUS_M:
-                    collision_detected = True
-
-        self.current_step += 1
-
-        if collision_detected:
-            self.collision_flash = 12
-
-        # Episode end: all at goal OR timeout
-        all_at_goal = all(
-            math.sqrt((self.drone_pos[i, 0] - self.goal_pos[0])**2 +
-                      (self.drone_pos[i, 1] - self.goal_pos[1])**2) < GOAL_RADIUS_M
-            for i in range(self.num_drones)
-        )
-        if all_at_goal or self.current_step >= 300:
-            self.reset_episode()
+        self._build_metrics()
+        self.spawn_goal()
+        self.spawn_uavs()
 
     # ─────────────────────────────────────────────────
     def reset_episode(self):
         self.episode_count += 1
         self.current_step   = 0
-        self.episode_flash  = 20
+        self.episode_flash  = 22
         self.spawn_goal()
-        self.spawn_drones()
+        self.spawn_uavs()
 
 
 state = SimulationState()
@@ -376,17 +202,17 @@ CORS(app)
 # DRAWING
 # ══════════════════════════════════════════════════════
 
-def draw_drone(draw, cx, cy, rot, label):
+def draw_drone(draw, x, y, rot, label):
     size = 20
-    draw.ellipse([cx-size, cy-size, cx+size, cy+size],
+    draw.ellipse([x-size, y-size, x+size, y+size],
                  fill=(30, 80, 40), outline=(100, 255, 150), width=2)
     for a in [0, 90, 180, 270]:
         rad = math.radians(a + rot)
-        draw.line([cx, cy,
-                   cx + 30 * math.cos(rad),
-                   cy + 30 * math.sin(rad)],
+        draw.line([x, y,
+                   x + 30 * math.cos(rad),
+                   y + 30 * math.sin(rad)],
                   fill=(100, 255, 150), width=2)
-    draw.text((cx - 15, cy + 25), label, fill=(100, 255, 150))
+    draw.text((x - 15, y + 25), label, fill=(100, 255, 150))
 
 
 # ══════════════════════════════════════════════════════
@@ -398,47 +224,108 @@ def generate_frame():
     img  = Image.new("RGB", (w, h), (15, 20, 25))
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # ── Collision flash (red) ──────────────────────
+    gx, gy    = state.goal_position
+    collision = False
+    new_pos   = []
+
+    # Swarm centroid — used for cohesion force
+    cx_avg = sum(p[0] for p in state.uav_positions) / 4
+    cy_avg = sum(p[1] for p in state.uav_positions) / 4
+
+    for i in range(4):
+        x, y = state.uav_positions[i]
+
+        # Goal-seeking
+        dx = gx - x
+        dy = gy - y
+        d  = math.sqrt(dx*dx + dy*dy) + 1e-6
+        vx = (dx/d) * DRONE_SPEED
+        vy = (dy/d) * DRONE_SPEED
+
+        # Obstacle repulsion
+        for ox, oy, r in state.obstacles:
+            ddx  = x - ox
+            ddy  = y - oy
+            dist = math.sqrt(ddx*ddx + ddy*ddy) + 1e-6
+            if dist < r + OBS_REPEL_DIST:
+                collision = True
+                rep = (r + OBS_REPEL_DIST - dist) / (r + OBS_REPEL_DIST)
+                vx += (ddx/dist) * rep * OBS_REPEL_STR
+                vy += (ddy/dist) * rep * OBS_REPEL_STR
+
+        # Cohesion — drift gently toward swarm centroid
+        vx += (cx_avg - x) * COHESION_STR
+        vy += (cy_avg - y) * COHESION_STR
+
+        # Separation — push away from too-close drones
+        for j in range(4):
+            if j == i:
+                continue
+            ox2, oy2 = state.uav_positions[j]
+            ddx  = x - ox2
+            ddy  = y - oy2
+            dist = math.sqrt(ddx*ddx + ddy*ddy) + 1e-6
+            if dist < DRONE_SEP_DIST:
+                sep = (DRONE_SEP_DIST - dist) / DRONE_SEP_DIST
+                vx += (ddx/dist) * sep * DRONE_SEP_STR
+                vy += (ddy/dist) * sep * DRONE_SEP_STR
+
+        # Small noise
+        vx += random.uniform(-NOISE, NOISE)
+        vy += random.uniform(-NOISE, NOISE)
+
+        nx = max(30, min(w - 30, x + vx * DT))
+        ny = max(30, min(h - 30, y + vy * DT))
+        new_pos.append((nx, ny))
+
+    state.uav_positions = new_pos
+    state.current_step += 1
+
+    # Episode reset — all drones inside goal ring
+    all_at_goal = all(
+        math.sqrt((px - gx)**2 + (py - gy)**2) < GOAL_RADIUS_PX
+        for px, py in state.uav_positions
+    )
+    if all_at_goal:
+        state.reset_episode()
+        gx, gy = state.goal_position   # draw from new goal position
+
+    # Collision flash (red)
+    if collision:
+        state.collision_flash = 10
     if state.collision_flash > 0:
-        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 80))
+        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 75))
         img.paste(overlay, (0, 0), overlay)
         state.collision_flash -= 1
 
-    # ── Episode complete flash (green) ────────────
+    # Episode-complete flash (green)
     if state.episode_flash > 0:
         overlay = Image.new("RGBA", (w, h), (0, 255, 100, 90))
         img.paste(overlay, (0, 0), overlay)
         state.episode_flash -= 1
 
-    # ── Obstacles ─────────────────────────────────
-    obs_vis_r = 0.3 * (w / 5.0)
-    for ox, oy in state.obstacle_positions:
-        cx, cy = state.pybullet_to_canvas(ox, oy)
-        draw.ellipse([cx - obs_vis_r, cy - obs_vis_r,
-                      cx + obs_vis_r, cy + obs_vis_r],
+    # Obstacles
+    for ox, oy, r in state.obstacles:
+        draw.ellipse([ox-r, oy-r, ox+r, oy+r],
                      fill=(180, 40, 40), outline=(255, 80, 80), width=3)
 
-    # ── Goal ──────────────────────────────────────
-    gx, gy = state.pybullet_to_canvas(state.goal_pos[0], state.goal_pos[1])
+    # Goal — outer ring + inner pulse ring
     draw.ellipse([gx - GOAL_RADIUS_PX, gy - GOAL_RADIUS_PX,
                   gx + GOAL_RADIUS_PX, gy + GOAL_RADIUS_PX],
                  outline=(255, 200, 0), width=3)
-    inner = GOAL_RADIUS_PX * 0.55
+    inner = int(GOAL_RADIUS_PX * 0.55)
     draw.ellipse([gx - inner, gy - inner, gx + inner, gy + inner],
-                 outline=(255, 220, 50, 110), width=1)
+                 outline=(255, 225, 60, 120), width=1)
 
-    # ── Drones ────────────────────────────────────
-    for i in range(state.num_drones):
-        cx, cy = state.pybullet_to_canvas(state.drone_pos[i, 0],
-                                           state.drone_pos[i, 1])
-        draw_drone(draw, cx, cy, state.drone_rot_vis[i], f"UAV-{i+1}")
+    # Drones
+    for i, (x, y) in enumerate(state.uav_positions):
+        state.uav_rotations[i] = (state.uav_rotations[i] + 10) % 360
+        draw_drone(draw, x, y, state.uav_rotations[i], f"UAV-{i+1}")
 
-    # ── HUD ───────────────────────────────────────
-    mode = "MADDPG" if state.actors_loaded else "STEERING"
+    # HUD
     draw.text((10, 10),
-              f"Episode: {state.episode_count}  |  Step: {state.current_step}"
-              f"  |  Mode: {mode}",
-              fill=(200, 200, 200))
+              f"Episode: {state.episode_count}   Step: {state.current_step}",
+              fill=(160, 200, 160))
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
@@ -452,12 +339,10 @@ def generate_frame():
 def run():
     while True:
         if state.running:
-            for _ in range(CTRL_PER_FRAME):
-                state.step()
             frame = generate_frame()
             with state.lock:
                 state.latest_frame = frame
-        time.sleep(0.033)   # ~30 fps
+        time.sleep(0.033)
 
 
 # ══════════════════════════════════════════════════════
@@ -501,7 +386,7 @@ def set_obs():
 def reset_stats():
     state.episode_count = 0
     state.current_step  = 0
-    state._compute_display_metrics()
+    state._build_metrics()
     return jsonify({"status": "success"})
 
 
@@ -522,9 +407,7 @@ def metrics():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "running",
-                    "maddpg": state.actors_loaded,
-                    "obstacles": state.num_obstacles})
+    return jsonify({"status": "running"})
 
 
 # ══════════════════════════════════════════════════════
