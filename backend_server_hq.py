@@ -215,28 +215,31 @@ def render_frame():
     # Note: y is flipped, so by1 > by2
     draw.rectangle([bx1, by2, bx2, by1], outline=(40, 70, 60), width=1)
 
-    # ── Goal zone — draw the FULL 3m success radius so it's clear ──
+    # ── Goal zone ──
     try:
         gx, gy  = state.pybullet_to_canvas(state.env.goal_pos[0], state.env.goal_pos[1])
-        goal_r  = state.meters_to_px(3.0)   # GOAL_RADIUS = 3.0m
-        pulse   = state.meters_to_px(0.1) * math.sin(time.time() * 4)
+
+        # Visual radius matches actual GOAL_RADIUS = 1.5m
+        visual_r = state.meters_to_px(1.5)
+        pulse    = state.meters_to_px(0.08) * math.sin(time.time() * 4)
 
         # Filled translucent zone
         draw.ellipse(
-            [gx - goal_r, gy - goal_r, gx + goal_r, gy + goal_r],
-            fill=(255, 200, 0, 18), outline=(255, 200, 0, 80), width=1
+            [gx - visual_r, gy - visual_r, gx + visual_r, gy + visual_r],
+            fill=(255, 200, 0, 25), outline=(255, 200, 0, 100), width=2
         )
         # Pulsing outer ring
         draw.ellipse(
-            [gx - goal_r - pulse, gy - goal_r - pulse,
-             gx + goal_r + pulse, gy + goal_r + pulse],
-            outline=(255, 200, 0, 50), width=1
+            [gx - visual_r - pulse, gy - visual_r - pulse,
+             gx + visual_r + pulse, gy + visual_r + pulse],
+            outline=(255, 200, 0, 45), width=1
         )
-        # Centre dot
-        draw.ellipse([gx - 6, gy - 6, gx + 6, gy + 6],
-                     fill=(255, 200, 0), outline=(255, 230, 100), width=1)
-        # Label
-        draw.text((gx + 8, gy - 10), "GOAL", fill=(255, 200, 0))
+        # Centre crosshair
+        ch = 8
+        draw.line([(gx - ch, gy), (gx + ch, gy)], fill=(255, 200, 0), width=1)
+        draw.line([(gx, gy - ch), (gx, gy + ch)], fill=(255, 200, 0), width=1)
+        draw.ellipse([gx - 4, gy - 4, gx + 4, gy + 4], fill=(255, 200, 0))
+        draw.text((gx + visual_r + 6, gy - 8), "GOAL", fill=(255, 200, 0))
     except Exception:
         pass
 
@@ -263,10 +266,8 @@ def render_frame():
             cx, cy = state.pybullet_to_canvas(pos[0], pos[1])
             state.drone_rotations[i] = (state.drone_rotations[i] + 8) % 360
 
-            # Check if this drone is inside goal zone
-            dist_to_goal = np.linalg.norm(
-                np.array(pos[:2]) - state.env.goal_pos[:2]
-            )
+            # Yellow when inside actual 3m success zone (3D distance, matches env logic)
+            dist_to_goal = np.linalg.norm(np.array(pos) - state.env.goal_pos)
             in_zone = dist_to_goal <= 3.0
 
             if crashed[i]:
