@@ -383,36 +383,33 @@ def config():
 
 @app.route("/start", methods=["POST"])
 def start():
+    """Start or resume the simulation"""
     data = request.json or {}
-    num_drones = data.get("num_drones", 4)
     num_obstacles = data.get("num_obstacles", state.num_obstacles)
-    
+
     checkpoint_map = {
         2: "checkpoints/maddpg_final-Ep17.pt",
         3: "checkpoints/maddpg_final-Ep17-o3-v2.pt",
         4: "checkpoints/maddpg_final-Ep17-o4-.pt",
     }
-    checkpoint_path = data.get("checkpoint_path", checkpoint_map.get(num_obstacles, checkpoint_map[4]))
-    
-    state.init_environment(num_drones, num_obstacles)
-    state.load_checkpoint(checkpoint_path, num_drones)
-    
+
+    # Only init if env doesn't exist yet (first boot edge case)
+    if state.env is None:
+        state.init_environment(num_drones=4, num_obstacles=num_obstacles)
+        state.load_checkpoint(checkpoint_map.get(num_obstacles, checkpoint_map[4]), num_agents=4)
+        state.episode_count = 0
+        state.step_count = 0
+
     state.running = True
-    state.episode_count = 0
-    state.step_count = 0
-    
-    print("[BACKEND] ✅ Simulation started")
-    return jsonify({"status": "started", "drones": num_drones, "obstacles": num_obstacles})
+    print("[BACKEND] ▶️  Simulation started")
+    return jsonify({"status": "started", "obstacles": state.num_obstacles})
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
+    """Pause the simulation — environment stays alive, just stops stepping"""
     state.running = False
-    
-    if state.env:
-        state.env.close()
-    
-    print("[BACKEND] ⏹️  Simulation stopped")
+    print("[BACKEND] ⏹️  Simulation paused")
     return jsonify({"status": "stopped"})
 
 
@@ -473,37 +470,44 @@ def reset_stats():
 
 @app.route("/set_obstacles", methods=["POST"])
 def set_obstacles():
-    """Switch obstacle configuration and reload matching checkpoint"""
+    """Switch obstacle config — pauses sim, swaps obstacles in existing PyBullet session, resumes"""
     data = request.get_json() or {}
     num_obstacles = data.get("num_obstacles", 4)
-    
+
     checkpoint_map = {
         2: "checkpoints/maddpg_final-Ep17.pt",
         3: "checkpoints/maddpg_final-Ep17-o3-v2.pt",
         4: "checkpoints/maddpg_final-Ep17-o4-.pt",
     }
-    
+
     if num_obstacles not in checkpoint_map:
         return jsonify({"status": "error", "message": f"Invalid num_obstacles: {num_obstacles}"}), 400
-    
+
     was_running = state.running
-    # Stop sim thread first, wait long enough for it to finish its current step
     state.running = False
-    time.sleep(0.35)  # sim loop sleeps 0.03s per step — 0.35s guarantees it's idle
-    
+    time.sleep(0.35)  # wait for sim thread to finish current step
+
     try:
-        state.init_environment(num_drones=4, num_obstacles=num_obstacles)
+        # Change num_obstacles on existing env — reset() will respawn with new obstacle count
+        if state.env is not None:
+            state.env.num_obstacles = num_obstacles
+        state.num_obstacles = num_obstacles
+
+        # Reload the matching checkpoint
         state.load_checkpoint(checkpoint_map[num_obstacles], num_agents=4)
-        # Reset ALL counters so metrics start fresh for this config
+
+        # Reset all counters
         state.episode_count = 0
         state.success_count = 0
         state.collision_count = 0
         state.step_count = 0
         state.episode_reward = 0.0
         state.last_crashed = []
-        state.last_obs = None   # forces sim thread to reset() on next iteration
+        state.last_obs = None  # triggers env.reset() on next sim loop iteration
+
         if was_running:
             state.running = True
+
         return jsonify({"status": "success", "num_obstacles": num_obstacles})
     except Exception as e:
         import traceback
@@ -518,15 +522,22 @@ def set_obstacles():
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Auto-start on Railway: init env + load checkpoint before Flask starts
-    print("[BOOT] Auto-initializing environment and loading checkpoint...")
+    # Pre-load environment and checkpoint on boot so /start is instant.
+    # simulation does NOT run until user presses Start Simulation.
+    print("[BOOT] Pre-loading environment (simulation will NOT run until /start is called)...")
     try:
         state.init_environment(num_drones=4, num_obstacles=4)
         state.load_checkpoint("checkpoints/maddpg_final-Ep17-o4-.pt", num_agents=4)
-        state.running = True
-        print("[BOOT] ✅ Environment ready, simulation will start with Flask")
+        state.running = False  # explicitly paused — user must press Start
+        print("[BOOT] ✅ Ready. Waiting for /start request.")
     except Exception as e:
-        print(f"[BOOT] ⚠️  Auto-start failed: {e} — use POST /start to initialize manually")
+        print(f"[BOOT] ⚠️  Pre-load failed: {e}")
+
+    sim_thread = threading.Thread(target=run_simulation, daemon=True)
+    sim_thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
     sim_thread = threading.Thread(target=run_simulation, daemon=True)
     sim_thread.start()
