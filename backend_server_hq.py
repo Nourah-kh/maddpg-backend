@@ -69,6 +69,7 @@ class BackendState:
         # Device
         self.device = "cpu"
         self.has_ever_started = False  # stays False until user presses Start
+        self.mission_time_avg = 0.0    # rolling average of steps per episode
     
     def load_checkpoint(self, checkpoint_path, num_agents=4):
         """Load trained MADDPG checkpoints from a single .pt file.
@@ -167,22 +168,18 @@ CORS(app)
 # Visualization Helpers
 # ══════════════════════════════════════════════════════════════════════
 
-def draw_drone(draw, x, y, rotation, label, size=20):
-    """Draw a drone as circle with propellers"""
+def draw_drone(draw, x, y, rotation, label, size=20, color=(100, 255, 150)):
+    """Draw a drone as circle with propeller arms"""
     draw.ellipse(
         [x-size, y-size, x+size, y+size],
-        fill=(30, 80, 40),
-        outline=(100, 255, 150),
-        width=2
+        fill=(30, 80, 40), outline=color, width=2
     )
-    
     for angle in [0, 90, 180, 270]:
-        a = math.radians(angle + rotation)
-        px = x + 30 * math.cos(a)
-        py = y + 30 * math.sin(a)
-        draw.line([x, y, px, py], fill=(100, 255, 150), width=2)
-    
-    draw.text((x-15, y+25), label, fill=(100, 255, 150))
+        a  = math.radians(angle + rotation)
+        px = x + (size + 12) * math.cos(a)
+        py = y + (size + 12) * math.sin(a)
+        draw.line([x, y, px, py], fill=color, width=2)
+    draw.text((x - 14, y + size + 4), label, fill=color)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -191,81 +188,69 @@ def draw_drone(draw, x, y, rotation, label, size=20):
 
 def render_frame():
     """Render 2D top-down view of simulation"""
-    if state.env is None:
+    if state.env is None or not state.env.DRONE_IDS:
         return None
 
     w, h = state.canvas_width, state.canvas_height
-    img = Image.new("RGB", (w, h), (15, 20, 25))
+    img  = Image.new("RGB", (w, h), (15, 20, 25))
     draw = ImageDraw.Draw(img, "RGBA")
 
     import pybullet as p
 
-    # Draw obstacles
-    obs_radius_m = 0.3
-    obs_radius_px = obs_radius_m * (w / 5.0)
-
+    # ── Obstacles ──
+    obs_radius_px = 0.4 * (w / 10.0)  # visual radius in pixels
     for obs_id in state.env.obstacle_ids:
-        obs_pos, _ = p.getBasePositionAndOrientation(
-            obs_id, physicsClientId=state.env.client
-        )
-        cx, cy = state.pybullet_to_canvas(obs_pos[0], obs_pos[1])
+        try:
+            obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=state.env.client)
+            cx, cy = state.pybullet_to_canvas(obs_pos[0], obs_pos[1])
+            draw.ellipse(
+                [cx-obs_radius_px, cy-obs_radius_px, cx+obs_radius_px, cy+obs_radius_px],
+                fill=(180, 40, 40), outline=(255, 80, 80), width=3
+            )
+        except Exception:
+            pass
 
+    # ── Goal (pulsing ring) ──
+    try:
+        gx, gy = state.pybullet_to_canvas(state.env.goal_pos[0], state.env.goal_pos[1])
+        # Goal radius is 3.0m — show it as a large circle
+        goal_r_px = 3.0 * (w / 10.0)
+        pulse = 5 * math.sin(time.time() * 3)
         draw.ellipse(
-            [cx-obs_radius_px, cy-obs_radius_px, cx+obs_radius_px, cy+obs_radius_px],
-            fill=(180, 40, 40),
-            outline=(255, 80, 80),
-            width=3
+            [gx - goal_r_px - pulse, gy - goal_r_px - pulse,
+             gx + goal_r_px + pulse, gy + goal_r_px + pulse],
+            outline=(255, 200, 0, 120), width=2
         )
+        # Inner dot
+        draw.ellipse([gx-8, gy-8, gx+8, gy+8], fill=(255, 200, 0))
+    except Exception:
+        pass
 
-    # Draw animated goal
-    goal_canvas = state.pybullet_to_canvas(
-        state.env.goal_position[0], state.env.goal_position[1]
-    )
-
-    pulse = 5 * math.sin(time.time() * 3)
-    r = 30 + pulse
-
-    draw.ellipse(
-        [goal_canvas[0]-r, goal_canvas[1]-r,
-         goal_canvas[0]+r, goal_canvas[1]+r],
-        outline=(255, 200, 0),
-        width=3
-    )
-
-    # Draw drones with persistent rotation
+    # ── Drones ──
+    crashed = state.env.crashed  # numpy bool array
     for i in range(state.num_drones):
-        pos, _ = p.getBasePositionAndOrientation(
-            state.env.drone_ids[i],
-            physicsClientId=state.env.client
-        )
+        try:
+            pos, _ = p.getBasePositionAndOrientation(
+                state.env.DRONE_IDS[i], physicsClientId=state.env.client
+            )
+            cx, cy = state.pybullet_to_canvas(pos[0], pos[1])
+            state.drone_rotations[i] = (state.drone_rotations[i] + 10) % 360
 
-        cx, cy = state.pybullet_to_canvas(pos[0], pos[1])
+            color = (255, 80, 80) if crashed[i] else (100, 255, 150)
+            draw_drone(draw, cx, cy, state.drone_rotations[i], f"UAV-{i+1}", size=18, color=color)
+        except Exception:
+            pass
 
-        state.drone_rotations[i] += 10
-
-        draw_drone(
-            draw,
-            cx,
-            cy,
-            state.drone_rotations[i],
-            f"UAV-{i+1}",
-            size=20
-        )
-
-    # Crash overlay
-    if any(state.last_crashed):
-        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 80))
+    # ── Crash flash ──
+    if any(crashed):
+        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 60))
         img.paste(overlay, (0, 0), overlay)
 
-    # HUD
-    hud_text = (
-        f"Episode: {state.episode_count} | "
-        f"Step: {state.step_count} | "
-        f"Reward: {state.episode_reward:.2f} | "
-        f"Collisions: {state.collision_count}"
-    )
-
-    draw.text((10, 10), hud_text, fill=(100, 255, 150))
+    # ── HUD ──
+    hud = (f"Episode: {state.episode_count}  |  "
+           f"Step: {state.step_count}  |  "
+           f"Obstacles: {state.num_obstacles}")
+    draw.text((10, 10), hud, fill=(100, 255, 150))
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
@@ -327,12 +312,17 @@ def run_simulation():
             episode_done = goal_reached or all(truncated.values())
 
             if episode_done:
-                # Record results
                 if goal_reached:
                     state.success_count += 1
                     episode_goal_reached = True
                 if episode_had_collision:
                     state.collision_count += 1
+
+                # Rolling average mission time
+                n = state.episode_count
+                state.mission_time_avg = (
+                    state.mission_time_avg * (n - 1) + state.step_count
+                ) / n if n > 0 else state.step_count
 
                 print(f"[EPISODE {state.episode_count}] done — "
                       f"steps={state.step_count} "
@@ -451,12 +441,16 @@ def video_feed():
 
 @app.route("/metrics", methods=["GET"])
 def metrics():
-    """Return metrics. All zeros until simulation is started."""
-    episodes = state.episode_count
-
-    if not state.has_ever_started or episodes == 0:
+    """
+    Return metrics.
+    - Before first Start: all zeros.
+    - While running: zeros (results shown only when paused).
+    - While paused after episodes: real computed values.
+    """
+    # Not started yet — all zeros
+    if not state.has_ever_started:
         return jsonify({
-            "running": state.running,
+            "running": False,
             "episodes": 0,
             "success_rate": 0.0,
             "current_step": 0,
@@ -466,30 +460,55 @@ def metrics():
             "avg_response_time": 0.0,
         })
 
-    success_rate = state.success_count / episodes * 100.0
-    collision_avoidance = 100.0 - (state.collision_count / episodes * 100.0)
+    episodes = state.episode_count
+
+    # While running — show live step/episode count but not final stats yet
+    if state.running:
+        return jsonify({
+            "running": True,
+            "episodes": episodes,
+            "success_rate": None,          # frontend should show "—" while running
+            "current_step": state.step_count,
+            "num_obstacles": state.num_obstacles,
+            "collision_avoidance": None,
+            "swarm_coordination": None,
+            "avg_response_time": None,
+        })
+
+    # Paused — show real results
+    if episodes == 0:
+        success_rate       = 0.0
+        collision_avoidance = 0.0
+    else:
+        success_rate        = round(state.success_count   / episodes * 100.0, 1)
+        collision_avoidance = round(
+            max(0.0, 100.0 - state.collision_count / episodes * 100.0), 1
+        )
 
     return jsonify({
-        "running": state.running,
+        "running": False,
         "episodes": episodes,
-        "success_rate": round(success_rate, 1),
+        "success_rate": success_rate,
         "current_step": state.step_count,
         "num_obstacles": state.num_obstacles,
-        "collision_avoidance": round(max(0.0, collision_avoidance), 1),
-        "swarm_coordination": 98.5,
-        "avg_response_time": 12.5,
+        "collision_avoidance": collision_avoidance,
+        "swarm_coordination": round(
+            (state.success_count / max(episodes, 1)) * 100.0, 1
+        ),
+        "avg_response_time": round(state.mission_time_avg, 1),
     })
 
 
 @app.route("/reset_stats", methods=["POST"])
 def reset_stats():
     """Reset episode statistics — sim continues but counters start from zero"""
-    state.episode_count = 0
-    state.success_count = 0
+    state.episode_count   = 0
+    state.success_count   = 0
     state.collision_count = 0
-    state.step_count = 0
-    state.episode_reward = 0.0
-    state.last_obs = None  # force episode reset in sim thread
+    state.step_count      = 0
+    state.episode_reward  = 0.0
+    state.mission_time_avg = 0.0
+    state.last_obs        = None
     return jsonify({"status": "reset"})
 
 
@@ -522,14 +541,15 @@ def set_obstacles():
         state.load_checkpoint(checkpoint_map[num_obstacles], num_agents=4)
 
         # Reset all counters
-        state.episode_count = 0
-        state.success_count = 0
-        state.collision_count = 0
-        state.step_count = 0
-        state.episode_reward = 0.0
-        state.last_crashed = []
-        state.last_obs = None  # triggers env.reset() on next sim loop iteration
-        state.has_ever_started = False  # metrics go back to zero for new config
+        state.episode_count    = 0
+        state.success_count    = 0
+        state.collision_count  = 0
+        state.step_count       = 0
+        state.episode_reward   = 0.0
+        state.mission_time_avg = 0.0
+        state.last_crashed     = []
+        state.last_obs         = None
+        state.has_ever_started = False
 
         if was_running:
             state.running = True
