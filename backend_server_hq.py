@@ -137,10 +137,17 @@ class BackendState:
         print(f"[ENV] Initialized with {num_drones} drones, {num_obstacles} obstacles")
     
     def pybullet_to_canvas(self, x, y):
-        """Convert PyBullet coordinates to canvas pixels"""
-        canvas_x = (x + 2.5) * (self.canvas_width / 5.0)
-        canvas_y = (2.5 - y) * (self.canvas_height / 5.0)
+        """Convert PyBullet world coords to canvas pixels.
+        World is [-5, +5] in both X and Y (MAX_BOUND_XY=5.0).
+        """
+        WORLD = 10.0  # total world span (-5 to +5)
+        canvas_x = (x + 5.0) * (self.canvas_width  / WORLD)
+        canvas_y = (5.0 - y) * (self.canvas_height / WORLD)
         return (canvas_x, canvas_y)
+
+    def meters_to_px(self, meters):
+        """Convert a distance in metres to pixels at current canvas scale."""
+        return meters * (self.canvas_width / 10.0)
     
     def get_maddpg_actions(self, observations):
         """Run actor networks to get actions for all drones."""
@@ -185,70 +192,124 @@ def draw_drone(draw, x, y, rotation, label, size=20, color=(100, 255, 150)):
 # ══════════════════════════════════════════════════════════════════════
 
 def render_frame():
-    """Render 2D top-down view of simulation"""
+    """Render 2D top-down view of simulation."""
     if state.env is None or not state.env.DRONE_IDS:
         return None
 
     w, h = state.canvas_width, state.canvas_height
-    img  = Image.new("RGB", (w, h), (15, 20, 25))
+    img  = Image.new("RGB", (w, h), (8, 12, 18))
     draw = ImageDraw.Draw(img, "RGBA")
 
     import pybullet as p
 
+    # ── Grid lines (subtle) ──
+    grid_color = (25, 35, 50)
+    for gx in range(0, w, w // 10):
+        draw.line([(gx, 0), (gx, h)], fill=grid_color, width=1)
+    for gy in range(0, h, h // 10):
+        draw.line([(0, gy), (w, gy)], fill=grid_color, width=1)
+
+    # ── Arena boundary (MAX_BOUND_XY = 5m from centre) ──
+    bx1, by1 = state.pybullet_to_canvas(-5.0, -5.0)
+    bx2, by2 = state.pybullet_to_canvas( 5.0,  5.0)
+    # Note: y is flipped, so by1 > by2
+    draw.rectangle([bx1, by2, bx2, by1], outline=(40, 70, 60), width=1)
+
+    # ── Goal zone — draw the FULL 3m success radius so it's clear ──
+    try:
+        gx, gy  = state.pybullet_to_canvas(state.env.goal_pos[0], state.env.goal_pos[1])
+        goal_r  = state.meters_to_px(3.0)   # GOAL_RADIUS = 3.0m
+        pulse   = state.meters_to_px(0.1) * math.sin(time.time() * 4)
+
+        # Filled translucent zone
+        draw.ellipse(
+            [gx - goal_r, gy - goal_r, gx + goal_r, gy + goal_r],
+            fill=(255, 200, 0, 18), outline=(255, 200, 0, 80), width=1
+        )
+        # Pulsing outer ring
+        draw.ellipse(
+            [gx - goal_r - pulse, gy - goal_r - pulse,
+             gx + goal_r + pulse, gy + goal_r + pulse],
+            outline=(255, 200, 0, 50), width=1
+        )
+        # Centre dot
+        draw.ellipse([gx - 6, gy - 6, gx + 6, gy + 6],
+                     fill=(255, 200, 0), outline=(255, 230, 100), width=1)
+        # Label
+        draw.text((gx + 8, gy - 10), "GOAL", fill=(255, 200, 0))
+    except Exception:
+        pass
+
     # ── Obstacles ──
-    obs_radius_px = 0.4 * (w / 10.0)  # visual radius in pixels
-    for obs_id in state.env.obstacle_ids:
-        try:
+    try:
+        obs_r = state.meters_to_px(0.4)  # obstacle visual radius
+        for obs_id in state.env.obstacle_ids:
             obs_pos, _ = p.getBasePositionAndOrientation(obs_id, physicsClientId=state.env.client)
             cx, cy = state.pybullet_to_canvas(obs_pos[0], obs_pos[1])
             draw.ellipse(
-                [cx-obs_radius_px, cy-obs_radius_px, cx+obs_radius_px, cy+obs_radius_px],
-                fill=(180, 40, 40), outline=(255, 80, 80), width=3
+                [cx - obs_r, cy - obs_r, cx + obs_r, cy + obs_r],
+                fill=(140, 30, 30), outline=(220, 60, 60), width=2
             )
-        except Exception:
-            pass
-
-    # ── Goal (pulsing ring) ──
-    try:
-        gx, gy = state.pybullet_to_canvas(state.env.goal_pos[0], state.env.goal_pos[1])
-        # Goal radius is 3.0m — show it as a large circle
-        goal_r_px = 3.0 * (w / 10.0)
-        pulse = 5 * math.sin(time.time() * 3)
-        draw.ellipse(
-            [gx - goal_r_px - pulse, gy - goal_r_px - pulse,
-             gx + goal_r_px + pulse, gy + goal_r_px + pulse],
-            outline=(255, 200, 0, 120), width=2
-        )
-        # Inner dot
-        draw.ellipse([gx-8, gy-8, gx+8, gy+8], fill=(255, 200, 0))
     except Exception:
         pass
 
     # ── Drones ──
-    crashed = state.env.crashed  # numpy bool array
+    crashed = state.env.crashed
     for i in range(state.num_drones):
         try:
             pos, _ = p.getBasePositionAndOrientation(
                 state.env.DRONE_IDS[i], physicsClientId=state.env.client
             )
             cx, cy = state.pybullet_to_canvas(pos[0], pos[1])
-            state.drone_rotations[i] = (state.drone_rotations[i] + 10) % 360
+            state.drone_rotations[i] = (state.drone_rotations[i] + 8) % 360
 
-            color = (255, 80, 80) if crashed[i] else (100, 255, 150)
-            draw_drone(draw, cx, cy, state.drone_rotations[i], f"UAV-{i+1}", size=18, color=color)
+            # Check if this drone is inside goal zone
+            dist_to_goal = np.linalg.norm(
+                np.array(pos[:2]) - state.env.goal_pos[:2]
+            )
+            in_zone = dist_to_goal <= 3.0
+
+            if crashed[i]:
+                color = (255, 60, 60)
+            elif in_zone:
+                color = (255, 220, 50)   # gold when inside goal zone
+            else:
+                color = (80, 220, 120)
+
+            draw_drone(draw, cx, cy, state.drone_rotations[i],
+                       f"UAV-{i+1}", size=14, color=color)
         except Exception:
             pass
 
+    # ── Success flash ──
+    if state.env.is_success:
+        overlay = Image.new("RGBA", (w, h), (255, 200, 0, 30))
+        img.paste(overlay, (0, 0), overlay)
+
     # ── Crash flash ──
-    if any(crashed):
-        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 60))
+    elif any(crashed):
+        overlay = Image.new("RGBA", (w, h), (255, 0, 0, 40))
         img.paste(overlay, (0, 0), overlay)
 
     # ── HUD ──
-    hud = (f"Episode: {state.episode_count}  |  "
-           f"Step: {state.step_count}  |  "
-           f"Obstacles: {state.num_obstacles}")
-    draw.text((10, 10), hud, fill=(100, 255, 150))
+    hud = (f"EP {state.episode_count}  |  "
+           f"STEP {state.step_count}  |  "
+           f"OBS {state.num_obstacles}  |  "
+           f"SUCCESS {state.success_count}/{max(state.episode_count-1,0)}")
+    draw.text((10, 10), hud, fill=(80, 180, 100))
+
+    # Goal distance for each drone
+    try:
+        for i in range(state.num_drones):
+            pos, _ = p.getBasePositionAndOrientation(
+                state.env.DRONE_IDS[i], physicsClientId=state.env.client
+            )
+            d = np.linalg.norm(np.array(pos) - state.env.goal_pos)
+            draw.text((10, 28 + i * 14),
+                      f"UAV-{i+1}: {d:.1f}m to goal",
+                      fill=(60, 130, 80))
+    except Exception:
+        pass
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
