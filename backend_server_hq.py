@@ -276,23 +276,48 @@ def render_frame():
 # ══════════════════════════════════════════════════════════════════════
 
 def run_simulation():
+    """Main simulation loop. Runs many episodes continuously until stopped."""
+    obs = None
+    episode_had_collision = False  # track per-episode, not per-step
+
     while True:
+        # ── Pause if stopped or env not ready ──
         if not state.running or state.env is None:
+            obs = None  # force reset when we resume
             time.sleep(0.1)
             continue
 
-        if state.step_count == 0 or state.step_count >= 300:
-            obs, info = state.env.reset()
+        # ── Start a new episode ──
+        if obs is None or state.step_count >= 300:
+            # Record results of the episode that just ended (skip episode 0)
+            if state.episode_count > 0:
+                if not episode_had_collision:
+                    state.success_count += 1
+                if episode_had_collision:
+                    state.collision_count += 1
+                print(f"[EPISODE {state.episode_count}] steps={state.step_count} "
+                      f"reward={state.episode_reward:.2f} collision={episode_had_collision}")
+
+            try:
+                obs, info = state.env.reset()
+            except Exception as e:
+                print(f"❌ Reset error: {e}")
+                time.sleep(0.5)
+                continue
+
             state.step_count = 0
             state.episode_reward = 0.0
             state.episode_count += 1
-            print(f"[EPISODE {state.episode_count}]")
+            episode_had_collision = False
+            print(f"[EPISODE {state.episode_count}] starting...")
 
         state.last_obs = obs
 
+        # ── MADDPG inference ──
         actions = state.get_maddpg_actions(obs)
         state.last_actions = actions
 
+        # ── Step environment ──
         try:
             obs, rewards, terminated, truncated, info = state.env.step(actions)
 
@@ -300,17 +325,18 @@ def run_simulation():
 
             state.last_crashed = state.env.crashed.copy()
             if any(state.last_crashed):
-                state.collision_count += 1
+                episode_had_collision = True  # flag for end-of-episode accounting
 
             state.step_count += 1
 
         except Exception as e:
             print(f"❌ Step error: {e}")
-            state.running = False
+            obs = None  # force reset next iteration instead of killing thread
+            time.sleep(0.2)
             continue
 
+        # ── Render ──
         frame = render_frame()
-
         if frame:
             with state.lock:
                 state.latest_frame = frame
@@ -435,12 +461,13 @@ def metrics():
 
 @app.route("/reset_stats", methods=["POST"])
 def reset_stats():
-    """Reset episode statistics"""
+    """Reset episode statistics — sim continues but counters start from zero"""
     state.episode_count = 0
     state.success_count = 0
     state.collision_count = 0
     state.step_count = 0
     state.episode_reward = 0.0
+    state.last_obs = None  # force episode reset in sim thread
     return jsonify({"status": "reset"})
 
 
@@ -460,18 +487,23 @@ def set_obstacles():
         return jsonify({"status": "error", "message": f"Invalid num_obstacles: {num_obstacles}"}), 400
     
     was_running = state.running
+    # Stop sim thread first, wait long enough for it to finish its current step
     state.running = False
-    time.sleep(0.15)  # let sim thread pause
+    time.sleep(0.35)  # sim loop sleeps 0.03s per step — 0.35s guarantees it's idle
     
     try:
         state.init_environment(num_drones=4, num_obstacles=num_obstacles)
         state.load_checkpoint(checkpoint_map[num_obstacles], num_agents=4)
+        # Reset ALL counters so metrics start fresh for this config
         state.episode_count = 0
         state.success_count = 0
         state.collision_count = 0
         state.step_count = 0
         state.episode_reward = 0.0
-        state.running = was_running
+        state.last_crashed = []
+        state.last_obs = None   # forces sim thread to reset() on next iteration
+        if was_running:
+            state.running = True
         return jsonify({"status": "success", "num_obstacles": num_obstacles})
     except Exception as e:
         import traceback
@@ -479,15 +511,6 @@ def set_obstacles():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-
-    return jsonify({
-        "episode": state.episode_count,
-        "step": state.step_count,
-        "episode_reward": state.episode_reward,
-        "collisions": state.collision_count,
-        "success_count": state.success_count,
-        "drones_crashed": int(sum(state.last_crashed)) if state.last_crashed else 0
-    })
 
 
 # ══════════════════════════════════════════════════════════════════════
