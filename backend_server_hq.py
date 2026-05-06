@@ -285,9 +285,10 @@ def render_frame():
             cx, cy = state.pybullet_to_canvas(pos[0], pos[1])
             state.drone_rotations[i] = (state.drone_rotations[i] + 8) % 360
 
-            # Yellow when inside actual 3m success zone (3D distance, matches env logic)
-            dist_to_goal = np.linalg.norm(np.array(pos) - state.env.goal_pos)
-            in_zone = dist_to_goal <= 3.0
+            # Yellow when inside the visible 2D goal circle.
+            # The actual success condition (3D) is checked separately by the env.
+            dist_2d = np.linalg.norm(np.array(pos[:2]) - state.env.goal_pos[:2])
+            in_zone = dist_2d <= 3.0
 
             if crashed[i]:
                 color = (255, 60, 60)
