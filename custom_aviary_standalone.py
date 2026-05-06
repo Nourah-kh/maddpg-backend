@@ -47,6 +47,7 @@ class CustomAviaryMADDPG:
         self.goal_position = None
         self.step_count = 0
         self.crashed = [False] * num_drones  # collision flags per drone
+        self.goal_reached = False
         
     def reset(self, seed=None):
         """Reset environment"""
@@ -63,14 +64,14 @@ class CustomAviaryMADDPG:
         self.goal_id = None
         self.step_count = 0
         self.crashed = [False] * self.num_drones
+        self.goal_reached = False
         
-        # Spawn drones near origin
+        # Spawn drones clustered near origin
         for i in range(self.num_drones):
-            x = np.random.uniform(-0.5, 0.5)
-            y = np.random.uniform(-0.5, 0.5)
+            x = np.random.uniform(-0.3, 0.3)
+            y = np.random.uniform(-0.3, 0.3)
             z = 0.5
             
-            # Create simple sphere as drone
             collision_shape = p.createCollisionShape(p.GEOM_SPHERE, radius=0.1)
             visual_shape = p.createVisualShape(p.GEOM_SPHERE, radius=0.1, rgbaColor=[0, 1, 0, 1])
             
@@ -82,7 +83,7 @@ class CustomAviaryMADDPG:
             )
             self.drone_ids.append(drone_id)
         
-        # Spawn obstacles
+        # Spawn obstacles at fixed positions
         if self.num_obstacles == 2:
             obs_positions = [
                 (2.5, 0.0, 0.4),
@@ -105,7 +106,6 @@ class CustomAviaryMADDPG:
         for ox, oy, oz in obs_positions:
             collision_shape = p.createCollisionShape(p.GEOM_CYLINDER, radius=self.obs_radius, height=0.5)
             visual_shape = p.createVisualShape(p.GEOM_CYLINDER, radius=self.obs_radius, length=0.5, rgbaColor=[1, 0, 0, 1])
-            
             obs_id = p.createMultiBody(
                 baseMass=0,
                 baseCollisionShapeIndex=collision_shape,
@@ -114,12 +114,28 @@ class CustomAviaryMADDPG:
             )
             self.obstacle_ids.append(obs_id)
         
-        # Random goal
-        self.goal_position = np.array([
-            np.random.uniform(-2.0, 2.0),
-            np.random.uniform(-2.0, 2.0),
-            0.5
-        ])
+        # Place goal in a safe zone: fixed candidate positions away from obstacles and origin
+        safe_goal_candidates = [
+            np.array([ 0.0,  2.5, 0.5]),
+            np.array([ 0.0, -2.5, 0.5]),
+            np.array([ 2.0,  2.0, 0.5]),
+            np.array([-2.0,  2.0, 0.5]),
+            np.array([-2.0, -2.0, 0.5]),
+            np.array([ 2.0, -2.0, 0.5]),
+        ]
+        obs_pos_array = [np.array([ox, oy, oz]) for ox, oy, oz in obs_positions]
+        
+        # Pick a goal candidate that is at least 1.0m from every obstacle
+        np.random.shuffle(safe_goal_candidates)
+        self.goal_position = safe_goal_candidates[0]  # fallback
+        for candidate in safe_goal_candidates:
+            too_close = any(
+                np.linalg.norm(candidate[:2] - op[:2]) < 1.0
+                for op in obs_pos_array
+            )
+            if not too_close:
+                self.goal_position = candidate
+                break
         
         # Create goal marker
         goal_visual = p.createVisualShape(p.GEOM_SPHERE, radius=0.2, rgbaColor=[1, 0.8, 0, 1])
@@ -129,9 +145,7 @@ class CustomAviaryMADDPG:
             basePosition=self.goal_position
         )
         
-        # Get initial observations
         obs = self._get_observations()
-        
         return obs, {}
     
     def _get_observations(self):
@@ -171,61 +185,66 @@ class CustomAviaryMADDPG:
 
         # Apply actions
         for i, drone_id in enumerate(self.drone_ids):
-            # Support both dict ({"drone_0": ...}) and list/array indexing
             drone_key = f"drone_{i}"
             if isinstance(actions, dict):
                 action = actions.get(drone_key, actions.get(i, np.zeros(4)))
             else:
                 action = actions[i]
             
-            # Simple velocity control
-            vx, vy, vz, yaw_rate = action * 2.0  # Scale actions
+            # Scale: action in [-1,1], move up to 0.05m per step (was 0.02 — too slow)
+            vx, vy, vz, _ = action * 0.05
             
             pos, orn = p.getBasePositionAndOrientation(drone_id)
             new_pos = [
-                pos[0] + vx * 0.01,
-                pos[1] + vy * 0.01,
-                max(0.1, pos[2] + vz * 0.01)  # don't go below floor
+                np.clip(pos[0] + vx, -3.5, 3.5),
+                np.clip(pos[1] + vy, -3.5, 3.5),
+                max(0.2, pos[2] + vz),
             ]
-            
             p.resetBasePositionAndOrientation(drone_id, new_pos, orn)
         
-        # Step simulation
         p.stepSimulation()
         self.step_count += 1
         
         # Check collisions
         for i, drone_id in enumerate(self.drone_ids):
             for obs_id in self.obstacle_ids:
-                contacts = p.getContactPoints(drone_id, obs_id)
-                if contacts:
+                if p.getContactPoints(drone_id, obs_id):
                     self.crashed[i] = True
         
-        # Get observations
         obs = self._get_observations()
         
-        # Calculate rewards
         rewards = {}
         terminated = {}
         truncated = {}
         
+        # Episode ends when the MAJORITY of drones reach the goal (or all crash)
+        drones_at_goal = 0
         for i in range(self.num_drones):
             drone_key = f"drone_{i}"
             pos = obs[drone_key][0:3]
-            
-            # Distance to goal
             dist_to_goal = np.linalg.norm(pos - self.goal_position)
             
-            # Reward
-            reward = 0.01  # survival
-            if dist_to_goal < 0.3:
-                reward += 10.0  # reached goal
+            reward = -0.01  # small penalty per step to encourage speed
+            if dist_to_goal < 0.5:
+                reward += 10.0
+                drones_at_goal += 1
+            elif dist_to_goal < 1.5:
+                reward += 1.0  # shaped reward: closer = better
+            
+            if self.crashed[i]:
+                reward -= 5.0
             
             rewards[drone_key] = reward
             terminated[drone_key] = False
-            truncated[drone_key] = self.step_count >= 500
+            truncated[drone_key] = self.step_count >= 400
         
-        return obs, rewards, terminated, truncated, {}
+        # Episode terminates when majority (>=2 of 4) reach the goal
+        self.goal_reached = drones_at_goal >= max(1, self.num_drones // 2)
+        if self.goal_reached:
+            for key in terminated:
+                terminated[key] = True
+        
+        return obs, rewards, terminated, truncated, {"goal_reached": self.goal_reached}
     
     def close(self):
         """Close PyBullet"""
